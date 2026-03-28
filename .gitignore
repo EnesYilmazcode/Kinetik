@@ -1,0 +1,16 @@
+# Secrets
+kimodo.txt
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp
+*.tmp

@@ -1,0 +1,9 @@
+Won 1st place in the Nano Banana track at the Google DeepMind x GLITCH Hackathon at UCLA.
+
+I built Kinetik, which is a Text-to-Animation engine. How it works is the user types a scene description and it generates a 3D animated character and environment.
+
+I incorporated the newly released NVIDIA Kimodo model for motion generation as well as Nanobanana and Trellis from Fal.ai for 3D asset creation.
+
+Huge thanks to Google DeepMind and GLITCH for putting this together at UCLA!
+
+GitHub: https://github.com/EnesYilmazcode/Kinetik

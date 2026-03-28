@@ -1,0 +1,104 @@
+# Kinetik
+
+Text-to-animated-3D-scene editor. Type a sentence, get a full 3D scene with an animated character. Edit the scene live — add objects, chain motions, sculpt terrain. No mocap, no Blender, no animators.
+
+Built at GLITCH x Google DeepMind @ UCLA.
+
+## How it works
+
+1. Type something like _"A person sneaks through a dark warehouse"_
+2. **Kimodo** (NVIDIA, on RunPod GPU) generates skeleton animation from the prompt
+3. **Gemini** picks scene objects, the layout engine places them around the character path
+4. **Nanobanana + Trellis** provide 73 pre-generated 3D models (trees, buildings, cars, furniture...)
+5. **Three.js** renders everything in the browser with a video-editor-style timeline
+
+## Key Features
+
+- **Motion timeline** — chain multiple animations with smooth 0.4s blend transitions
+- **Scene editor** — add, move, rotate, scale objects. Build mode activates on selection.
+- **Tabbed sidebar** — Activity log and Add panel side-by-side on the left for quick access
+- **Custom 3D model creation** — type any object name, AI generates it in ~30 seconds live
+- **73 pre-built models** — generated via Nanobanana (Gemini image gen) → Trellis v1 (fal.ai 3D reconstruction)
+- **One-click video render** — zooms out to a cinematic high angle and records a 6s orbit video with music
+- **Terrain system** — ground rises/falls based on character path elevation
+- **Path visualization** — toggleable character trajectory with waypoint markers (hidden by default)
+- **Auto-environment** — trees, rocks, bushes auto-fill around the scene in 3 rings
+- **Camera follow** — ground tracks character, Reset View button smoothly returns camera
+- **Prompt enhancement** — silently rewrites prompts for better Kimodo results
+
+## Stack
+
+| What | How |
+|------|-----|
+| Motion generation | NVIDIA Kimodo on RunPod (text → BVH skeletal animation) |
+| Scene planning | Gemini 2.5 Flash (prompt → structured JSON) |
+| 3D rendering | Three.js + GLTFLoader + BVHLoader + AnimationMixer |
+| 3D asset generation | Nanobanana (Gemini image gen) + Trellis v1 (fal.ai, image → GLB) |
+| Backend | FastAPI on RunPod (RTX 5000 Ada) |
+| Frontend | Vanilla JS, single index.html |
+
+## Running locally
+
+```bash
+# Start the RunPod pod (needs GPU with Kimodo installed)
+# Then on the pod:
+cd /workspace && uvicorn server_fast:app --host 0.0.0.0 --port 8000
+
+# Locally, serve the frontend:
+python -m http.server 8080
+# Open http://localhost:8080
+```
+
+Set the RunPod API URL in `index.html` — look for the `API` variable near the top.
+
+## Generating 3D models
+
+73 models live in `models/` as `.glb` files. Generated with a two-step pipeline:
+
+1. **Nanobanana** (Gemini Flash Image) generates a 3D render of each object
+2. **Trellis v1** (fal.ai) reconstructs a textured GLB mesh from that image
+
+```bash
+pip install httpx
+# Edit OBJECTS list in generate_models.py or new_models.txt
+python generate_models.py
+```
+
+Models generate to a temp folder first (no live-reload flicker) then copy to `models/` when done. Cost: ~$0.02 per model.
+
+Users can also create custom models live in the editor — type any object name in the Add panel.
+
+## Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play/pause animation |
+| M | Move mode (drag to reposition) |
+| R | Rotate mode (drag to rotate) |
+| S | Scale mode (drag to resize) |
+| Escape | Deselect, exit build mode |
+| Backspace | Delete selected object/clip |
+| [ ] | Reserved |
+
+## Project structure
+
+```
+index.html              — entire frontend (Three.js, UI, editor, timeline)
+server_fast.py          — FastAPI backend for Kimodo on RunPod
+generate_models.py      — batch model generation script
+new_models.txt          — model names to generate next
+models/                 — 73 .glb + .png assets
+context.md              — full project briefing
+nanobanana_pipeline.md  — model generation API docs
+```
+
+## Credits
+
+- [NVIDIA Kimodo](https://github.com/nv-tlabs/kimodo) — motion generation model
+- [fal.ai Trellis](https://fal.ai) — image-to-3D mesh reconstruction
+- [Google Gemini](https://ai.google.dev) — scene planning and image generation
+- [Three.js](https://threejs.org) — 3D rendering engine
+
+## Team
+
+Built by Enes Yilmaz ([@enesy](https://github.com/enesy)) — CS & Engineering, Ohio State University

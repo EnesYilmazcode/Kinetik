@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Kinetik Viewer</title>
+    <style>
+        body { margin: 0; background: #0a0a14; overflow: hidden; font-family: monospace; }
+        #info {
+            position: absolute; top: 10px; left: 10px; color: #a78bfa;
+            background: rgba(0,0,0,0.7); padding: 10px 16px; border-radius: 6px;
+            font-size: 14px; z-index: 10;
+        }
+        #drop-zone {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #666; font-size: 20px; text-align: center; z-index: 10;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Kinetik Viewer — drag & drop a .bvh file or it auto-loads test_motion.bvh</div>
+    <div id="drop-zone">Drop a .bvh file here<br><br><small>or wait for auto-load...</small></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a14);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 150, 300);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 100, 0);
+        controls.update();
+
+        // Grid floor
+        const grid = new THREE.GridHelper(500, 20, 0x333355, 0x222244);
+        scene.add(grid);
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0x404060, 2));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(100, 200, 100);
+        scene.add(dirLight);
+
+        let mixer = null;
+        const clock = new THREE.Clock();
+
+        function loadBVH(text) {
+            document.getElementById('drop-zone').style.display = 'none';
+
+            // Clear previous
+            scene.children.forEach(child => {
+                if (child.type === 'SkeletonHelper' || child.type === 'Bone') {
+                    scene.remove(child);
+                }
+            });
+
+            const loader = new BVHLoader();
+            const result = loader.parse(text);
+
+            const skeletonHelper = new THREE.SkeletonHelper(result.skeleton.bones[0]);
+            skeletonHelper.material.linewidth = 2;
+            skeletonHelper.material.color = new THREE.Color(0xa78bfa);
+            scene.add(result.skeleton.bones[0]);
+            scene.add(skeletonHelper);
+
+            mixer = new THREE.AnimationMixer(result.skeleton.bones[0]);
+            const action = mixer.clipAction(result.clip);
+            action.play();
+
+            document.getElementById('info').textContent =
+                `Kinetik Viewer — ${result.skeleton.bones.length} bones, ${result.clip.duration.toFixed(1)}s`;
+        }
+
+        // Auto-load test_motion.bvh
+        fetch('silly_dance.bvh')
+            .then(r => { if (r.ok) return r.text(); throw new Error('not found'); })
+            .then(text => loadBVH(text))
+            .catch(() => console.log('No test_motion.bvh found, drag & drop a file'));
+
+        // Drag & drop
+        document.addEventListener('dragover', e => e.preventDefault());
+        document.addEventListener('drop', e => {
+            e.preventDefault();
+            const file = e.dataTransfer.files[0];
+            if (file && file.name.endsWith('.bvh')) {
+                file.text().then(text => loadBVH(text));
+            }
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (mixer) mixer.update(clock.getDelta());
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

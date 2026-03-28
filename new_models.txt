@@ -1,0 +1,118 @@
+## New models to generate (batch 2)
+## Review this list, edit as needed, then run: python generate_models.py
+##
+## Categories covered:
+##   Nature/Outdoor - more variety beyond tree/bush/rock
+##   Urban/City - fill out streetscapes
+##   Indoor/Home - more furniture + appliances
+##   Fun/Thematic - spooky, beach, fantasy, sports
+##   Vehicles - expand the fleet
+##   Food/Market - street life detail
+
+# --- NATURE / OUTDOOR ---
+mushroom
+stump
+cactus
+sunflower
+lily pad
+moss covered rock
+fallen branch
+bird nest
+beehive
+scarecrow
+flower pot
+garden gnome
+well
+wooden fence gate
+
+# --- URBAN / CITY ---
+fire hydrant red
+parking meter
+newspaper box
+manhole cover
+street bench
+bus
+traffic light
+neon sign
+dumpster fire escape
+awning storefront
+scaffolding
+electric pole
+sewer grate
+concrete barrier
+
+# --- INDOOR / HOME ---
+washing machine
+microwave
+kitchen sink
+nightstand
+wardrobe closet
+ceiling fan
+potted plant indoor
+rug carpet
+fireplace
+grandfather clock
+coat rack
+mirror
+wine rack
+aquarium
+
+# --- BEACH / TROPICAL ---
+palm tree tall
+beach umbrella
+surfboard
+lifeguard tower
+beach chair
+sandcastle
+coconut
+tiki torch
+
+# --- SPOOKY / HALLOWEEN ---
+skeleton
+coffin
+spider web
+dead tree
+crow
+witch cauldron
+iron gate
+lantern old
+
+# --- FANTASY / MEDIEVAL ---
+treasure chest
+wooden shield
+sword in stone
+throne
+medieval torch
+cannon
+catapult
+well medieval
+
+# --- SPORTS / PLAYGROUND ---
+baseball bat
+tennis racket
+skateboard ramp
+trampoline
+volleyball net
+weight bench
+pull up bar
+hurdle
+
+# --- VEHICLES ---
+ambulance
+fire truck
+helicopter
+airplane small
+golf cart
+delivery van
+school bus
+garbage truck
+
+# --- FOOD / MARKET ---
+fruit stand
+pizza box
+coffee cup large
+barrel wooden
+wine barrel
+market stall
+popcorn machine
+gumball machine
