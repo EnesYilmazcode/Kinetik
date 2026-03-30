@@ -117,7 +117,7 @@ Users can also create custom models live in the editor — type any object name 
 | S | Scale mode (drag to resize) |
 | Escape | Deselect, exit build mode |
 | Backspace | Delete selected object/clip |
-| [ ] | Reserved |
+
 
 ## Project structure
 
