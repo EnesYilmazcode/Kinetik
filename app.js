@@ -1255,11 +1255,9 @@ function tryProceduralModel(keyword, height) {
     return null;
 }
 
-// Poly Pizza model fetching + GLB loading (with client-side layout for positioning)
-const polyCache = {};
+// Model lookup + GLB loading (with client-side layout for positioning)
 const modelCache = {};
 
-// DISABLED: Poly Pizza model fetching — replaced by Nanobanana + Trellis pipeline
 // Pre-generated GLB models are served from local /models/ folder
 // Map keywords to local model files — multiple keywords per model
 const MODEL_MAP = {
@@ -1347,7 +1345,7 @@ for (const [file, keywords] of Object.entries(MODEL_MAP)) {
     }
 }
 
-async function fetchPolyModel(keyword, category) {
+async function findLocalModel(keyword, category) {
     const kw = keyword.toLowerCase().trim();
     // Exact match
     if (KEYWORD_TO_FILE[kw]) return KEYWORD_TO_FILE[kw];
@@ -1689,7 +1687,6 @@ async function buildScene(config) {
     sceneObjects.forEach(obj => scene.remove(obj));
     sceneObjects = [];
     grid.visible = false;
-    Object.keys(polyCache).forEach(k => delete polyCache[k]);
     Object.keys(modelCache).forEach(k => delete modelCache[k]);
 
     // Ground created after layout so we know the world extent
@@ -1796,7 +1793,7 @@ async function buildScene(config) {
             return;
         }
 
-        const glbUrl = await fetchPolyModel(m.keyword, m.category);
+        const glbUrl = await findLocalModel(m.keyword, m.category);
         if (glbUrl) {
             const loaded = await loadGLBModel(glbUrl, m.position, m.scale, m.rotationY || 0);
             if (loaded) loaded.userData._keyword = m.keyword;
@@ -2739,7 +2736,7 @@ async function handleAddObject(params) {
     }
 
     // Fetch from Poly Pizza
-    const glbUrl = await fetchPolyModel(params.keyword, params.category || 11);
+    const glbUrl = await findLocalModel(params.keyword, params.category || 11);
     if (glbUrl) {
         const loaded = await loadGLBModel(glbUrl, position, targetScale, Math.random() * Math.PI * 2);
         if (loaded) loaded.userData._keyword = params.keyword;
