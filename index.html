@@ -718,7 +718,7 @@
 
             // Load GLB mesh
             const glb = await new Promise((resolve, reject) => {
-                gltfLoader.load('soma_mesh.glb', resolve, undefined, reject);
+                gltfLoader.load('assets/character/soma_mesh.glb', resolve, undefined, reject);
             });
             // Find the first Mesh in the GLB (may be nested)
             let mesh = null;
@@ -735,7 +735,7 @@
             somaGeometry.computeVertexNormals();
 
             // Load skin data binary (4 uint8 indices + 4 float16 weights per vertex)
-            const resp = await fetch('soma_skin.bin');
+            const resp = await fetch('assets/character/soma_skin.bin');
             const buf = await resp.arrayBuffer();
             const view = new DataView(buf);
             const vertCount = posAttr.count;
@@ -759,7 +759,7 @@
             somaSkinData = true;
 
             // Load RAW bind transforms, scale translation, then invert in JS
-            const bindResp = await fetch('soma_bind_raw.bin');
+            const bindResp = await fetch('assets/character/soma_bind_raw.bin');
             const bindBuf = await bindResp.arrayBuffer();
             const bindFloats = new Float32Array(bindBuf); // 29 * 16 = 464 floats
             somaBindInverses = [];
@@ -1071,7 +1071,7 @@
                 return c;
             }
             const glb = await new Promise((resolve, reject) => {
-                gltfLoader.load('human.glb', resolve, undefined, reject);
+                gltfLoader.load('assets/character/human.glb', resolve, undefined, reject);
             });
             // Wrap in a container group so we can scale the container
             // (the GLB scene may have internal transforms we can't override)
@@ -2720,11 +2720,11 @@ RULES:
 
         // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
         const WELCOME_MOTIONS = [
-            { file: 'backflip.bvh', label: 'backflip' },
-            { file: 'silly_dance.bvh', label: 'dancing' },
-            { file: 'spinning_kick.bvh', label: 'spinning kick', mirror: true },
-            { file: 'sneak_forward.bvh', label: 'sneaking' },
-            { file: 'drunk_dance.bvh', label: 'vibing' },
+            { file: 'assets/motions/backflip.bvh', label: 'backflip' },
+            { file: 'assets/motions/silly_dance.bvh', label: 'dancing' },
+            { file: 'assets/motions/spinning_kick.bvh', label: 'spinning kick', mirror: true },
+            { file: 'assets/motions/sneak_forward.bvh', label: 'sneaking' },
+            { file: 'assets/motions/drunk_dance.bvh', label: 'vibing' },
         ];
         let welcomeMotionIdx = 0;
         let welcomeInterval = null;

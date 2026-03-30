@@ -1,7 +1,7 @@
 # Kinetik
 
 <p align="center">
-  <img src="Kinetik.gif" alt="Kinetik demo" width="600">
+  <img src="assets/media/Kinetik.gif" alt="Kinetik demo" width="600">
 </p>
 
 Text-to-animated-3D-scene editor. Type a sentence, get a full 3D scene with an animated character. Edit the scene live — add objects, chain motions, sculpt terrain. No mocap, no Blender, no animators.
@@ -17,7 +17,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 5. **Three.js** renders everything in the browser with a video-editor-style timeline
 
 <p align="center">
-  <img src="demo1.png" alt="Generated scene" width="500">
+  <img src="assets/media/demo1.png" alt="Generated scene" width="500">
 </p>
 
 ## Key Features
@@ -50,7 +50,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 ```bash
 # Start the RunPod pod (needs GPU with Kimodo installed)
 # Then on the pod:
-cd /workspace && uvicorn server_fast:app --host 0.0.0.0 --port 8000
+cd /workspace && uvicorn scripts.server_fast:app --host 0.0.0.0 --port 8000
 
 # Locally, serve the frontend:
 python -m http.server 8080
@@ -68,8 +68,8 @@ Set the RunPod API URL in `index.html` — look for the `API` variable near the 
 
 ```bash
 pip install httpx
-# Edit OBJECTS list in generate_models.py or new_models.txt
-python generate_models.py
+# Edit OBJECTS list in scripts/generate_models.py or docs/new_models.txt
+python scripts/generate_models.py
 ```
 
 Models generate to a temp folder first (no live-reload flicker) then copy to `models/` when done. Cost: ~$0.02 per model.
@@ -91,13 +91,18 @@ Users can also create custom models live in the editor — type any object name 
 ## Project structure
 
 ```
-index.html              — entire frontend (Three.js, UI, editor, timeline)
-server_fast.py          — FastAPI backend for Kimodo on RunPod
-generate_models.py      — batch model generation script
-new_models.txt          — model names to generate next
-models/                 — 73 .glb + .png assets
-context.md              — full project briefing
-nanobanana_pipeline.md  — model generation API docs
+index.html                — frontend (Three.js, UI, editor, timeline)
+viewer.html               — standalone BVH animation viewer
+models/                   — 73 pre-generated .glb + .png assets
+assets/
+  motions/                — sample BVH animations
+  character/              — SOMA character mesh + skeleton data
+  media/                  — README images and demo gif
+scripts/
+  server_fast.py          — FastAPI backend for Kimodo on RunPod
+  generate_models.py      — batch model generation script
+  main.py                 — CLI motion generation test
+docs/                     — project docs and research notes
 ```
 
 ## Credits

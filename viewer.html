@@ -88,7 +88,7 @@
         }
 
         // Auto-load test_motion.bvh
-        fetch('silly_dance.bvh')
+        fetch('assets/motions/silly_dance.bvh')
             .then(r => { if (r.ok) return r.text(); throw new Error('not found'); })
             .then(text => loadBVH(text))
             .catch(() => console.log('No test_motion.bvh found, drag & drop a file'));

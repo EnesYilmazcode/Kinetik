@@ -19,9 +19,9 @@ r = httpx.post(f"{RUNPOD_URL}/generate-motion", json={
 }, timeout=120)
 
 if r.status_code == 200 and "error" not in r.headers.get("content-type", ""):
-    with open("test_motion.bvh", "wb") as f:
+    with open("assets/motions/test_motion.bvh", "wb") as f:
         f.write(r.content)
-    print("SUCCESS! Saved to test_motion.bvh")
+    print("SUCCESS! Saved to assets/motions/test_motion.bvh")
     print("Open viewer.html in your browser to see the animation")
 else:
     print("Error:", r.status_code, r.text)

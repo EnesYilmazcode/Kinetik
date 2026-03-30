@@ -97,7 +97,7 @@ Kimodo is a kinematic motion diffusion model released by NVIDIA literally 2 week
 - First run downloads models (~15-20 min for text encoder). After that, 2-5 sec per generation.
 - Output: NPZ files containing `posed_joints [T, 77, 3]` (global joint positions per frame at 30fps) and BVH files (standard motion capture format that Three.js can load with BVHLoader)
 
-**My HuggingFace token is saved locally (not committed to git).**
+**My HuggingFace token is saved in a local file called kimodo.txt. The key starts with hf_vP...**
 
 **Kimodo limitations to know:**
 - Max 10 seconds per prompt
