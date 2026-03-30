@@ -16,6 +16,10 @@ Built at GLITCH x Google DeepMind @ UCLA.
 4. **Nanobanana + Trellis** provide 73 pre-generated 3D models (trees, buildings, cars, furniture...)
 5. **Three.js** renders everything in the browser with a video-editor-style timeline
 
+<p align="center">
+  <img src="demo1.png" alt="Generated scene" width="500">
+</p>
+
 ## Key Features
 
 - **Motion timeline** — chain multiple animations with smooth 0.4s blend transitions
