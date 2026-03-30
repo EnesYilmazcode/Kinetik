@@ -453,7 +453,6 @@ async function loadHumanModel() {
     const box = new THREE.Box3().setFromObject(container);
     const size = new THREE.Vector3();
     box.getSize(size);
-    console.log('Human model raw size:', size.x.toFixed(1), size.y.toFixed(1), size.z.toFixed(1));
 
     container.scale.setScalar(18.7);
 
@@ -2308,17 +2307,13 @@ let welcomeInterval = null;
     }
     // Schedule first transition after initial clip ends
     fetch(WELCOME_MOTIONS[0].file)
-        .then(r => { console.log('Welcome BVH fetch:', r.status, r.url); return r.ok ? r.text() : null; })
+        .then(r => r.ok ? r.text() : null)
         .then(text => {
             if (text) {
-                console.log('Welcome BVH loaded, length:', text.length);
                 try {
                     const dur = wLoadBVH(text);
-                    console.log('Welcome BVH parsed, duration:', dur);
                     setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
                 } catch(e) { console.error('Welcome BVH parse error:', e); }
-            } else {
-                console.error('Welcome BVH fetch returned null');
             }
         })
         .catch(e => { console.error('Welcome BVH fetch failed:', e); });
