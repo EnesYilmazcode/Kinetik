@@ -19,7 +19,7 @@
     </style>
 </head>
 <body>
-    <div id="info">Kinetik Viewer — drag & drop a .bvh file or it auto-loads test_motion.bvh</div>
+    <div id="info">Kinetik Viewer — drag & drop a .bvh file or it auto-loads silly_dance.bvh</div>
     <div id="drop-zone">Drop a .bvh file here<br><br><small>or wait for auto-load...</small></div>
 
     <script type="importmap">
@@ -89,11 +89,11 @@
                 `Kinetik Viewer — ${result.skeleton.bones.length} bones, ${result.clip.duration.toFixed(1)}s`;
         }
 
-        // Auto-load test_motion.bvh
+        // Auto-load silly_dance.bvh
         fetch('assets/motions/silly_dance.bvh')
             .then(r => { if (r.ok) return r.text(); throw new Error('not found'); })
             .then(text => loadBVH(text))
-            .catch(() => console.log('No test_motion.bvh found, drag & drop a file'));
+            .catch(() => console.log('No silly_dance.bvh found, drag & drop a file'));
 
         // Drag & drop
         document.addEventListener('dragover', e => e.preventDefault());
