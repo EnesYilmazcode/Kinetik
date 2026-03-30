@@ -1,5 +1,9 @@
 # Kinetik
 
+<p align="center">
+  <img src="kinetik.gif" alt="Kinetik demo" width="600">
+</p>
+
 Text-to-animated-3D-scene editor. Type a sentence, get a full 3D scene with an animated character. Edit the scene live — add objects, chain motions, sculpt terrain. No mocap, no Blender, no animators.
 
 Built at GLITCH x Google DeepMind @ UCLA.
