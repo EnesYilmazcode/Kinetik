@@ -74,7 +74,7 @@
             const result = loader.parse(text);
 
             const skeletonHelper = new THREE.SkeletonHelper(result.skeleton.bones[0]);
-            skeletonHelper.material.linewidth = 2;
+            // linewidth >1 not supported in WebGL
             skeletonHelper.material.color = new THREE.Color(0xa78bfa);
             scene.add(result.skeleton.bones[0]);
             scene.add(skeletonHelper);

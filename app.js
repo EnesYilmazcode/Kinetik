@@ -60,7 +60,7 @@ function showSelectionBox(obj) {
     size.multiplyScalar(1.08);
     const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
     const edges = new THREE.EdgesGeometry(geo);
-    const mat = new THREE.LineBasicMaterial({ color: 0x9b7fd4, linewidth: 2, transparent: true, opacity: 1 });
+    const mat = new THREE.LineBasicMaterial({ color: 0x9b7fd4, transparent: true, opacity: 1 });
     selectionBox = new THREE.LineSegments(edges, mat);
     selectionBox.position.copy(center);
     selectionBox.userData._isSelectionBox = true;
@@ -793,7 +793,7 @@ function updatePathVisualization(charPath) {
         return new THREE.Vector3(p[0], elevation + 3, p[2] || 0); // slightly above terrain
     });
     const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
-    const lineMat = new THREE.LineBasicMaterial({ color: 0x7c5cbf, linewidth: 2 });
+    const lineMat = new THREE.LineBasicMaterial({ color: 0x7c5cbf });
     const line = new THREE.Line(lineGeo, lineMat);
     group.add(line);
 
