@@ -1,0 +1,3700 @@
+import * as THREE from 'three';
+import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const API = 'https://c8sh4j1k8nkzp9-8000.proxy.runpod.net';
+const GEMINI_KEY = ''; // Set your Gemini API key here (see .env)
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
+const viewport = document.getElementById('viewport');
+
+// Three.js setup
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd8d8d0);
+
+const camera = new THREE.PerspectiveCamera(60, viewport.clientWidth / viewport.clientHeight, 1, 10000);
+camera.position.set(0, 150, 400);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+viewport.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 100, 0);
+controls.update();
+
+// Grid
+const grid = new THREE.GridHelper(500, 20, 0xc0c0b8, 0xccccc4);
+scene.add(grid);
+
+// Lights — soft key + fill + rim for nice form
+scene.add(new THREE.AmbientLight(0x303050, 1.5));
+const keyLight = new THREE.DirectionalLight(0xffffff, 2);
+keyLight.position.set(100, 200, 150);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(0x8888ff, 0.8);
+fillLight.position.set(-100, 100, -50);
+scene.add(fillLight);
+const rimLight = new THREE.DirectionalLight(0xa78bfa, 1);
+rimLight.position.set(0, 50, -200);
+scene.add(rimLight);
+
+let mixer = null;
+let currentBones = null;
+let currentHelper = null;
+let characterGroup = null;
+let bodyMeshes = [];
+// Selection & animation control state
+let selectedObject = null, selectedType = null;
+let selectionBox = null; // purple wireframe box around selected object
+
+function showSelectionBox(obj) {
+    removeSelectionBox();
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+    // Add a little padding
+    size.multiplyScalar(1.08);
+    const geo = new THREE.BoxGeometry(size.x, size.y, size.z);
+    const edges = new THREE.EdgesGeometry(geo);
+    const mat = new THREE.LineBasicMaterial({ color: 0x9b7fd4, linewidth: 2, transparent: true, opacity: 1 });
+    selectionBox = new THREE.LineSegments(edges, mat);
+    selectionBox.position.copy(center);
+    selectionBox.userData._isSelectionBox = true;
+    scene.add(selectionBox);
+}
+
+function removeSelectionBox() {
+    if (selectionBox) {
+        scene.remove(selectionBox);
+        selectionBox.geometry.dispose();
+        selectionBox.material.dispose();
+        selectionBox = null;
+    }
+}
+let somaGeometry = null;
+let somaSkinData = null;
+let somaBindInverses = null;
+let skinnedCharMesh = null;
+
+// BVH joint names in the order the skin data references them
+const BVH_JOINT_NAMES = ['Hips','Spine1','Spine2','Chest','Neck1','Neck2','Head','HeadEnd','Jaw','LeftEye','RightEye','LeftShoulder','LeftArm','LeftForeArm','LeftHand','RightShoulder','RightArm','RightForeArm','RightHand','LeftLeg','LeftShin','LeftFoot','LeftToeBase','LeftToeEnd','RightLeg','RightShin','RightFoot','RightToeBase','RightToeEnd'];
+
+// Load the SOMA mesh + skin data (cached after first load)
+async function loadSomaMesh() {
+    if (somaGeometry && somaSkinData && somaBindInverses) return;
+
+    // Load GLB mesh
+    const glb = await new Promise((resolve, reject) => {
+        gltfLoader.load('assets/character/soma_mesh.glb', resolve, undefined, reject);
+    });
+    // Find the first Mesh in the GLB (may be nested)
+    let mesh = null;
+    glb.scene.traverse(child => { if (!mesh && child.isMesh) mesh = child; });
+    if (!mesh) throw new Error('No mesh found in GLB');
+    somaGeometry = mesh.geometry.clone();
+
+    // Scale from meters to BVH units (~100x)
+    const posAttr = somaGeometry.getAttribute('position');
+    for (let i = 0; i < posAttr.count; i++) {
+        posAttr.setXYZ(i, posAttr.getX(i) * 100, posAttr.getY(i) * 100, posAttr.getZ(i) * 100);
+    }
+    posAttr.needsUpdate = true;
+    somaGeometry.computeVertexNormals();
+
+    // Load skin data binary (4 uint8 indices + 4 float16 weights per vertex)
+    const resp = await fetch('assets/character/soma_skin.bin');
+    const buf = await resp.arrayBuffer();
+    const view = new DataView(buf);
+    const vertCount = posAttr.count;
+
+    const skinIndices = new Uint16Array(vertCount * 4);
+    const skinWeights = new Float32Array(vertCount * 4);
+
+    for (let v = 0; v < vertCount; v++) {
+        const off = v * 12; // 4 bytes indices + 8 bytes weights
+        for (let j = 0; j < 4; j++) {
+            skinIndices[v * 4 + j] = view.getUint8(off + j);
+        }
+        for (let j = 0; j < 4; j++) {
+            // float16 read
+            skinWeights[v * 4 + j] = readFloat16(view, off + 4 + j * 2);
+        }
+    }
+
+    somaGeometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
+    somaGeometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
+    somaSkinData = true;
+
+    // Load RAW bind transforms, scale translation, then invert in JS
+    const bindResp = await fetch('assets/character/soma_bind_raw.bin');
+    const bindBuf = await bindResp.arrayBuffer();
+    const bindFloats = new Float32Array(bindBuf); // 29 * 16 = 464 floats
+    somaBindInverses = [];
+    for (let i = 0; i < 29; i++) {
+        const r = bindFloats.subarray(i * 16, (i + 1) * 16);
+        // NumPy stores row-major: [r0c0, r0c1, r0c2, r0c3, r1c0, r1c1, ...]
+        // Three.js .elements stores column-major: [c0r0, c0r1, c0r2, c0r3, c1r0, ...]
+        // So we need to transpose when writing to .elements
+        const bindMat = new THREE.Matrix4();
+        bindMat.elements[0]  = r[0];  bindMat.elements[1]  = r[4];  bindMat.elements[2]  = r[8];   bindMat.elements[3]  = r[12];
+        bindMat.elements[4]  = r[1];  bindMat.elements[5]  = r[5];  bindMat.elements[6]  = r[9];   bindMat.elements[7]  = r[13];
+        bindMat.elements[8]  = r[2];  bindMat.elements[9]  = r[6];  bindMat.elements[10] = r[10];  bindMat.elements[11] = r[14];
+        bindMat.elements[12] = r[3] * 100;  bindMat.elements[13] = r[7] * 100;  bindMat.elements[14] = r[11] * 100;  bindMat.elements[15] = r[15];
+
+        // Invert the bind matrix to get the inverse bind matrix
+        const invMat = bindMat.clone().invert();
+        somaBindInverses.push(invMat);
+    }
+}
+
+// Float16 reader
+function readFloat16(view, offset) {
+    const h = view.getUint16(offset, true);
+    const s = (h >> 15) & 1;
+    const e = (h >> 10) & 0x1f;
+    const f = h & 0x3ff;
+    if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+    if (e === 31) return f ? NaN : (s ? -Infinity : Infinity);
+    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+let currentClip = null, currentAction = null;
+let isPlaying = true, isScrubbing = false;
+let lastBvhText = null;
+let timelineClips = [];
+let totalDuration = 0;
+let groundMesh = null; // Reference to ground plane for dynamic repositioning
+const clock = new THREE.Clock();
+
+// Body segments: [fromBone, toBone, radiusTop, radiusBottom]
+// Modeled after a wooden drawing mannequin
+const BODY_SEGMENTS = [
+    // Full torso — one smooth piece, broader at top
+    ['Hips', 'Neck1', 10, 7],
+    // Neck
+    ['Neck1', 'Head', 3, 3],
+    // Shoulders
+    ['Chest', 'LeftShoulder', 5, 4],
+    ['Chest', 'RightShoulder', 5, 4],
+    // Left arm
+    ['LeftShoulder', 'LeftArm', 4, 3.5],
+    ['LeftArm', 'LeftForeArm', 3.5, 3],
+    ['LeftForeArm', 'LeftHand', 3, 2],
+    // Right arm
+    ['RightShoulder', 'RightArm', 4, 3.5],
+    ['RightArm', 'RightForeArm', 3.5, 3],
+    ['RightForeArm', 'RightHand', 3, 2],
+    // Left leg
+    ['LeftLeg', 'LeftShin', 5.5, 4],
+    ['LeftShin', 'LeftFoot', 4, 3],
+    ['LeftFoot', 'LeftToeBase', 3, 2],
+    // Right leg
+    ['RightLeg', 'RightShin', 5.5, 4],
+    ['RightShin', 'RightFoot', 4, 3],
+    ['RightFoot', 'RightToeBase', 3, 2],
+    // Hip to leg — thin peg connectors
+    ['Hips', 'LeftLeg', 3.5, 3.5],
+    ['Hips', 'RightLeg', 3.5, 3.5],
+];
+
+const bodyColor = 0xd4b896; // wooden mannequin color
+
+function findBone(root, name) {
+    if (root.name === name) return root;
+    for (const child of root.children) {
+        const found = findBone(child, name);
+        if (found) return found;
+    }
+    return null;
+}
+
+function createBodyMeshes(rootBone) {
+    bodyMeshes.forEach(m => scene.remove(m));
+    bodyMeshes = [];
+
+    const mat = new THREE.MeshStandardMaterial({
+        color: bodyColor, roughness: 0.75, metalness: 0.0,
+    });
+
+    // Head — elongated sphere
+    const headBone = findBone(rootBone, 'HeadEnd');
+    if (headBone) {
+        const geo = new THREE.SphereGeometry(1, 24, 20);
+        const mesh = new THREE.Mesh(geo, mat.clone());
+        mesh.userData.type = 'head';
+        mesh.userData.bone = headBone;
+        mesh.userData.baseBone = findBone(rootBone, 'Head');
+        scene.add(mesh);
+        bodyMeshes.push(mesh);
+    }
+
+    // Smooth tapered cylinders between bone pairs
+    const tv1 = new THREE.Vector3();
+    const tv2 = new THREE.Vector3();
+
+    for (const [fromName, toName, rTop, rBot] of BODY_SEGMENTS) {
+        const fromBone = findBone(rootBone, fromName);
+        const toBone = findBone(rootBone, toName);
+        if (!fromBone || !toBone) continue;
+
+        fromBone.getWorldPosition(tv1);
+        toBone.getWorldPosition(tv2);
+        const dist = tv1.distanceTo(tv2);
+
+        // Tapered cylinder with hemisphere caps via LatheGeometry
+        const height = Math.max(dist, 1);
+        const segments = 20; // smoother capsules
+        // Create smooth profile: bottom cap → cylinder → top cap
+        const points = [];
+        const capSteps = 8;
+        // Bottom hemisphere cap
+        for (let i = 0; i <= capSteps; i++) {
+            const angle = (Math.PI / 2) * (i / capSteps);
+            points.push(new THREE.Vector2(
+                Math.sin(angle) * rBot,
+                -height / 2 - Math.cos(angle) * rBot + rBot
+            ));
+        }
+        // Tapered body
+        points.push(new THREE.Vector2(rBot, -height / 2 + rBot));
+        points.push(new THREE.Vector2(rTop, height / 2 - rTop));
+        // Top hemisphere cap
+        for (let i = 0; i <= capSteps; i++) {
+            const angle = (Math.PI / 2) * (i / capSteps);
+            points.push(new THREE.Vector2(
+                Math.cos(angle) * rTop,
+                height / 2 + Math.sin(angle) * rTop - rTop
+            ));
+        }
+
+        const geo = new THREE.LatheGeometry(points, segments);
+        const mesh = new THREE.Mesh(geo, mat.clone());
+        mesh.userData.type = 'capsule';
+        mesh.userData.fromBone = fromBone;
+        mesh.userData.toBone = toBone;
+        mesh.castShadow = true;
+        scene.add(mesh);
+        bodyMeshes.push(mesh);
+    }
+
+    // Hands — slightly flattened spheres
+    for (const handName of ['LeftHand', 'RightHand']) {
+        const bone = findBone(rootBone, handName);
+        if (bone) {
+            const geo = new THREE.SphereGeometry(4, 12, 10);
+            const mesh = new THREE.Mesh(geo, mat.clone());
+            mesh.userData.type = 'joint';
+            mesh.userData.bone = bone;
+            scene.add(mesh);
+            bodyMeshes.push(mesh);
+        }
+    }
+}
+
+const _v1 = new THREE.Vector3();
+const _v2 = new THREE.Vector3();
+const _mid = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _quat = new THREE.Quaternion();
+const _dir = new THREE.Vector3();
+
+function updateBodyMeshes() {
+    for (const mesh of bodyMeshes) {
+        if (mesh.userData.type === 'head') {
+            // Position between Head and HeadEnd, scale as ellipsoid
+            const base = mesh.userData.baseBone;
+            const top = mesh.userData.bone;
+            base.getWorldPosition(_v1);
+            top.getWorldPosition(_v2);
+            _mid.lerpVectors(_v1, _v2, 0.5);
+            mesh.position.copy(_mid);
+            const h = _v1.distanceTo(_v2);
+            mesh.scale.set(8, h * 0.6, 8.5);
+            _dir.subVectors(_v2, _v1).normalize();
+            if (_dir.lengthSq() > 0.0001) {
+                _quat.setFromUnitVectors(_up, _dir);
+                mesh.quaternion.copy(_quat);
+            }
+            continue;
+        }
+
+        if (mesh.userData.type === 'joint') {
+            mesh.userData.bone.getWorldPosition(_v1);
+            mesh.position.copy(_v1);
+            continue;
+        }
+
+        // Capsule — position at midpoint, orient along bone axis
+        const from = mesh.userData.fromBone;
+        const to = mesh.userData.toBone;
+        from.getWorldPosition(_v1);
+        to.getWorldPosition(_v2);
+
+        _mid.lerpVectors(_v1, _v2, 0.5);
+        mesh.position.copy(_mid);
+
+        _dir.subVectors(_v2, _v1).normalize();
+        if (_dir.lengthSq() > 0.0001) {
+            _quat.setFromUnitVectors(_up, _dir);
+            mesh.quaternion.copy(_quat);
+        }
+    }
+}
+
+// Extract the character's root path from a BVH clip (sample every N frames)
+// Silently rewrite the user's prompt to produce better, more dynamic motion.
+// Always biases toward locomotion (walking/moving forward) and exaggerated body movement.
+function enhanceMotionPrompt(userPrompt) {
+    let p = userPrompt;
+
+    // Replace common verbs with more dynamic versions
+    // Convert terrain-related prompts to actions Kimodo handles better
+    p = p.replace(/\bclimb(?:s|ing)?\s+(?:a\s+)?(?:hill|mountain|slope|incline|ridge)\b/gi, 'climbs up a long staircase steadily, one step at a time');
+    p = p.replace(/\b(?:go|goes|going|walk|walks|walking)\s+up(?:hill| a hill| the hill| a slope)\b/gi, 'walks up stairs steadily');
+    p = p.replace(/\b(?:go|goes|going|walk|walks|walking)\s+down(?:hill| a hill| the hill| a slope)\b/gi, 'walks down stairs carefully');
+    p = p.replace(/\bhike(?:s|ing)?\b/gi, 'walks up and down stairs while moving forward');
+
+    const replacements = {
+        'walks': 'walks forward confidently with long strides and arm swings',
+        'walk': 'walk forward with long exaggerated strides, swinging arms',
+        'runs': 'runs forward fast with high knees, pumping arms, covering ground',
+        'run': 'run forward fast with high knees, pumping arms, covering distance',
+        'jogs': 'jogs forward energetically with bouncy steps, moving across the space',
+        'jog': 'jog forward energetically with bouncy steps covering ground',
+        'dances': 'dances with large expressive full-body movements, stepping side to side',
+        'dance': 'dance with big expressive full-body movements, stepping around the space',
+        'stands': 'shifts weight and moves around slowly while standing',
+        'stand': 'shift weight and sway while moving slightly forward',
+        'sits': 'sits down then gets up and moves around',
+        'sit': 'sit down briefly then stand and walk forward',
+        'does karate': 'performs karate kicks and punches while stepping forward aggressively',
+        'does kung fu': 'performs kung fu strikes and kicks moving across the floor',
+        'fights': 'fights with punches and kicks, advancing forward aggressively',
+        'trips': 'trips and stumbles forward dramatically, arms flailing',
+        'falls': 'falls forward dramatically with arms reaching out',
+        'sneaks': 'sneaks forward in a low crouch, moving carefully across the space',
+        'sneak': 'sneak forward in a low crouch, tiptoeing across the room',
+        'explores': 'walks around exploring, looking in different directions while moving',
+        'relaxes': 'stretches and moves around lazily, shifting positions',
+        'celebrates': 'jumps and pumps fists while moving around excitedly',
+        'shops': 'walks forward browsing, stopping briefly then moving on',
+    };
+
+    // Apply replacements (case-insensitive, whole word)
+    for (const [from, to] of Object.entries(replacements)) {
+        const regex = new RegExp('\\b' + from + '\\b', 'gi');
+        p = p.replace(regex, to);
+    }
+
+    // If no movement verb was found, append locomotion bias
+    const hasMovement = /walk|run|jog|step|move|kick|punch|jump|dance|sneak|strid|crawl/i.test(p);
+    if (!hasMovement) {
+        p += '. The person should walk forward while doing this, covering distance across the space';
+    }
+
+    // Always append quality suffix
+    p += '. Make all movements large, exaggerated, and continuous. The person should travel forward through space, not stay in place.';
+
+    return p;
+}
+
+function extractPathFromBVH(text) {
+    const loader = new BVHLoader();
+    const result = loader.parse(text);
+    const clip = result.clip;
+    const root = result.skeleton.bones[0];
+
+    // Find the Hips position track (Root stays at 0,0,0 — Hips has the actual movement)
+    const posTrack = clip.tracks.find(t => t.name.includes('Hips') && t.name.endsWith('.position'))
+        || clip.tracks.find(t => t.name.endsWith('.position'));
+    if (!posTrack) return { path: [[0, 0]], result };
+
+    const values = posTrack.values;
+    const totalFrames = values.length / 3;
+    const path = [];
+    const numSamples = Math.min(30, totalFrames); // More samples for smoother path
+    const step = Math.max(1, Math.floor(totalFrames / numSamples));
+    for (let i = 0; i < totalFrames; i += step) {
+        const x = values[i * 3];
+        const y = values[i * 3 + 1]; // height
+        const z = values[i * 3 + 2];
+        path.push([Math.round(x), Math.round(y), Math.round(z)]);
+    }
+    if (totalFrames > 0) {
+        const lx = values[(totalFrames - 1) * 3];
+        const ly = values[(totalFrames - 1) * 3 + 1];
+        const lz = values[(totalFrames - 1) * 3 + 2];
+        path.push([Math.round(lx), Math.round(ly), Math.round(lz)]);
+    }
+    return { path, result };
+}
+
+// Cache the human GLB model
+let humanModelTemplate = null;
+async function loadHumanModel() {
+    if (humanModelTemplate) {
+        const c = humanModelTemplate.clone();
+        // Preserve scale from template
+        c.scale.copy(humanModelTemplate.scale);
+        return c;
+    }
+    const glb = await new Promise((resolve, reject) => {
+        gltfLoader.load('assets/character/human.glb', resolve, undefined, reject);
+    });
+    // Wrap in a container group so we can scale the container
+    // (the GLB scene may have internal transforms we can't override)
+    const container = new THREE.Group();
+    container.add(glb.scene);
+
+    // Measure raw size
+    const box = new THREE.Box3().setFromObject(container);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    console.log('Human model raw size:', size.x.toFixed(1), size.y.toFixed(1), size.z.toFixed(1));
+
+    container.scale.setScalar(18.7);
+
+    // Center the model at origin and put feet at Y=0 relative to container
+    const sb = new THREE.Box3().setFromObject(container);
+    const center = new THREE.Vector3();
+    sb.getCenter(center);
+    // When attached to Hips bone (Y~94), we need feet at Y = -94 relative to Hips
+    container.position.set(-center.x, -sb.min.y - 94, -center.z);
+
+    humanModelTemplate = container;
+    return container;
+}
+
+function loadBVH(text) {
+    // Clear previous
+    if (characterGroup) scene.remove(characterGroup);
+    if (currentHelper) scene.remove(currentHelper);
+    if (skinnedCharMesh) { skinnedCharMesh = null; }
+    bodyMeshes.forEach(m => scene.remove(m));
+    bodyMeshes = [];
+
+    const loader = new BVHLoader();
+    const result = loader.parse(text);
+
+    characterGroup = new THREE.Group();
+    currentBones = result.skeleton.bones[0];
+    characterGroup.add(currentBones);
+    scene.add(characterGroup);
+    currentHelper = null;
+
+    createBodyMeshes(currentBones);
+
+    // Use a SINGLE mixer for both sampling and playback.
+    // Previous approach (tempMixer + setTime + uncacheRoot) was unreliable.
+    mixer = new THREE.AnimationMixer(currentBones);
+    mixer.timeScale = 1.5;
+    currentClip = result.clip;
+    currentAction = mixer.clipAction(currentClip);
+    currentAction.play();
+
+    // Sample foot bone positions across the animation to find the lowest Y.
+    // Use mixer.update(dt) — the standard Three.js way to evaluate tracks —
+    // instead of setTime() which may not reliably apply all track types.
+    let globalMinY = Infinity;
+    const bonePos = new THREE.Vector3();
+    const clipDuration = result.clip.duration;
+    const samples = 20;
+    const dt = clipDuration / samples;
+    const footNames = ['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase'];
+
+    for (let s = 0; s <= samples; s++) {
+        mixer.update(s === 0 ? 0.0001 : dt);
+        characterGroup.updateMatrixWorld(true);
+        for (const name of footNames) {
+            const bone = findBone(currentBones, name);
+            if (bone) {
+                bone.getWorldPosition(bonePos);
+                if (bonePos.y < globalMinY) globalMinY = bonePos.y;
+            }
+        }
+    }
+
+    // Ground the character: offset so the lowest foot capsule bottom touches Y=0.
+    // Subtract the foot capsule bottom radius (2) so the visual mesh sits on the ground.
+    const footCapsuleRadius = 2;
+    characterGroup.position.y = -(globalMinY - footCapsuleRadius);
+
+    // Reset to beginning for clean playback
+    currentAction.reset();
+    currentAction.play();
+    isPlaying = true;
+    mixer.setTime(0);
+    clock.getDelta(); // drain clock so first frame gets a small delta
+
+    document.getElementById('gen-info').textContent =
+        `${result.skeleton.bones.length} joints — ${result.clip.duration.toFixed(1)}s @ 30fps`;
+}
+
+// ========== GEMINI SCENE AGENT ==========
+
+// Gemini only picks WHAT objects — client code handles WHERE to place them
+const SCENE_SYSTEM_PROMPT = `You are a creative 3D scene designer. Given a user prompt, pick objects that belong in the scene. Output ONLY valid JSON (no markdown, no backticks).
+
+You do NOT need to specify positions — the engine handles placement automatically. Just pick the right objects.
+
+JSON structure:
+{"scene":{"type":"outdoor"|"indoor","models":[{"keyword":"search term","category":number,"size":"large"|"medium"|"small"}],"ground":{"color":"#hex"},"lights":[{"type":"ambient"|"directional"|"point","intensity":0-3,"color":"#hex","position":[x,y,z]}]},"motion_prompt":"A person ..."}
+
+POLY PIZZA CATEGORIES: 0=Food, 1=Clutter, 3=Transport, 4=Furniture, 5=Objects, 6=Nature, 7=Animals, 8=Buildings, 11=Other
+
+CRITICAL — THEMATIC RELEVANCE:
+Every model MUST belong in the scene. "Would this object exist in this real-world location?"
+- Living room: sofa, table, lamp, bookshelf, TV, plant. NOT: car, building, tree, hydrant
+- City street: building, apartment, car, lamp, bench. NOT: sofa, bed, campfire
+- Forest: tree, rock, log, mushroom, campfire. NOT: skyscraper, car, desk
+- Beach: palm, umbrella, boat, rock. NOT: building, bookshelf
+Think carefully. Every object must make sense for the specific scene.
+
+BANNED KEYWORDS (NEVER use): "fence", "gate", "wall", "barrier", "shelter", "bus stop", "bus shelter", "canopy", "awning", "stop sign", "road barrier", "barricade"
+
+SIZE GUIDE:
+- "large": buildings, houses, large trees, skyscrapers (background structures)
+- "medium": cars, street lamps, small trees, sofas, bookshelves (mid-sized objects)
+- "small": bench, chair, hydrant, trash can, flower, cone, barrel, crate (small props)
+
+RULES:
+- 6-8 models. Mix: 2-3 large + 2-3 medium + 2-3 small
+- Each keyword must be UNIQUE — no repeats
+- Be CREATIVE with keywords! Don't use the same objects every time. Examples:
+  Buildings: apartment, church, castle, tower, warehouse, factory, hotel, restaurant, bakery, cinema, museum, cottage, cabin
+  Nature: oak, pine, palm, willow, cactus, bush, boulder, stump, mushroom
+  Vehicles: sedan, truck, motorcycle, bicycle, taxi, ambulance, van, boat, scooter
+  Props: lamppost, hydrant, mailbox, barrel, crate, statue, fountain, well, windmill, flag, phone booth, umbrella, trashcan, planter
+  Furniture: sofa, armchair, bookshelf, desk, bed, dresser, TV, piano, rug, clock
+- motion_prompt MUST start with "A person" and describe expressive, continuous motion
+- 2-3 lights, always include ambient (0.8-1.5). No fog.`;
+
+async function callGemini(userPrompt, characterPath = null) {
+    let fullPrompt = SCENE_SYSTEM_PROMPT + '\n\nUser prompt: ' + userPrompt;
+    if (characterPath && characterPath.length > 0) {
+        // Send only x,z to Gemini (it doesn't need Y)
+        const flatPath = characterPath.map(p => [p[0], p[2] || p[1]]);
+        fullPrompt += `\n\nCHARACTER PATH (the character moves through these [x,z] points — DO NOT place any object within 150 units of this path):\n${JSON.stringify(flatPath)}`;
+    }
+    const res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: [{ parts: [{ text: fullPrompt }] }],
+            generationConfig: { temperature: 0.7 }
+        })
+    });
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error('Gemini returned empty response');
+    // Strip markdown code fences if present
+    const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    return JSON.parse(clean);
+}
+
+const gltfLoader = new GLTFLoader();
+let sceneObjects = [];
+let pathLine = null;
+let pathVisible = false;
+
+// ========== PROCEDURAL GROUND TEXTURE ==========
+function createTexturedGround(size, baseColor) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 512; canvas.height = 512;
+    const ctx = canvas.getContext('2d');
+
+    // Parse base color
+    const tmp = new THREE.Color(baseColor);
+    const r = Math.floor(tmp.r * 255), g = Math.floor(tmp.g * 255), b = Math.floor(tmp.b * 255);
+
+    // Fill base
+    ctx.fillStyle = baseColor;
+    ctx.fillRect(0, 0, 512, 512);
+
+    // Add noise variation — multiple passes for organic feel
+    for (let pass = 0; pass < 3; pass++) {
+        const blockSize = [16, 8, 4][pass];
+        const strength = [25, 15, 8][pass];
+        for (let y = 0; y < 512; y += blockSize) {
+            for (let x = 0; x < 512; x += blockSize) {
+                const vary = (Math.random() - 0.5) * strength;
+                const nr = Math.min(255, Math.max(0, r + vary));
+                const ng = Math.min(255, Math.max(0, g + vary * 0.9));
+                const nb = Math.min(255, Math.max(0, b + vary * 0.7));
+                ctx.fillStyle = `rgba(${nr|0},${ng|0},${nb|0},${[0.6, 0.4, 0.3][pass]})`;
+                ctx.fillRect(x, y, blockSize, blockSize);
+            }
+        }
+    }
+
+    // Add subtle grid lines for spatial reference
+    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.15)`;
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 512; i += 64) {
+        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 512); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(512, i); ctx.stroke();
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(size / 200, size / 200);
+
+    const geo = new THREE.PlaneGeometry(size, size, 64, 64); // 64x64 subdivisions for terrain
+    const mat = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.92 });
+    const plane = new THREE.Mesh(geo, mat);
+    plane.rotation.x = -Math.PI / 2;
+    return plane;
+}
+
+// Displace terrain vertices based on path Y values
+function applyTerrainFromPath(terrainMesh, pathPoints) {
+    if (!pathPoints || pathPoints.length < 2) return;
+    const baseY = pathPoints[0][1] || 94;
+
+    // Detect sustained elevation: look at the trend, not spikes (jumps)
+    // Smooth the Y values first to filter out jumps
+    const smoothedY = pathPoints.map((p, i) => {
+        const y = p[1] || 94;
+        // Average with neighbors (3-point moving average)
+        const prev = (pathPoints[i - 1]?.[1] || y);
+        const next = (pathPoints[i + 1]?.[1] || y);
+        return (prev + y + next) / 3;
+    });
+
+    // Check if there's a sustained trend (not just bouncing)
+    const maxSmoothedDelta = Math.max(...smoothedY.map(y => Math.abs(y - baseY)));
+    if (maxSmoothedDelta < 3) return; // No meaningful elevation
+
+    const posAttr = terrainMesh.geometry.getAttribute('position');
+
+    for (let i = 0; i < posAttr.count; i++) {
+        // PlaneGeometry is created in XY plane, then rotated -90° on X.
+        // Before rotation: local X = world X, local Y = world -Z
+        const vx = posAttr.getX(i);   // world X
+        const vz = -posAttr.getY(i);  // world Z (negated!)
+
+        // Find two closest path points and interpolate — allows both incline AND decline
+        let best1 = { d: Infinity, h: 0 }, best2 = { d: Infinity, h: 0 };
+
+        for (let j = 0; j < pathPoints.length; j++) {
+            const p = pathPoints[j];
+            const px = p[0], pz = p[2] || 0;
+            const d = Math.sqrt((vx - px) ** 2 + (vz - pz) ** 2);
+            const h = smoothedY[j] - baseY;
+            if (d < best1.d) {
+                best2 = { ...best1 };
+                best1 = { d, h };
+            } else if (d < best2.d) {
+                best2 = { d, h };
+            }
+        }
+
+        // Interpolate between two nearest for smooth slopes
+        const totalD = best1.d + best2.d;
+        const height = totalD > 0.1
+            ? (best1.h * (1 - best1.d / totalD) + best2.h * (1 - best2.d / totalD))
+            : best1.h;
+
+        // Wider falloff near the path, tight enough to look like terrain
+        const influence = Math.exp(-(best1.d * best1.d) / (120 * 120));
+        posAttr.setZ(i, height * influence * 1.2);
+    }
+    posAttr.needsUpdate = true;
+    terrainMesh.geometry.computeVertexNormals();
+}
+
+// ========== PATH VISUALIZATION ==========
+// Extract path from an AnimationClip directly (not BVH text)
+function extractPathFromClip(clip) {
+    const posTrack = clip.tracks.find(t => t.name.includes('Hips') && t.name.endsWith('.position'));
+    if (!posTrack) return [[0, 0, 0]];
+    const values = posTrack.values;
+    const totalFrames = values.length / 3;
+    const path = [];
+    const numSamples = Math.min(40, totalFrames);
+    const step = Math.max(1, Math.floor(totalFrames / numSamples));
+    for (let i = 0; i < totalFrames; i += step) {
+        path.push([Math.round(values[i * 3]), Math.round(values[i * 3 + 1]), Math.round(values[i * 3 + 2])]);
+    }
+    if (totalFrames > 0) {
+        path.push([Math.round(values[(totalFrames - 1) * 3]), Math.round(values[(totalFrames - 1) * 3 + 1]), Math.round(values[(totalFrames - 1) * 3 + 2])]);
+    }
+    return path;
+}
+
+// Spawn fill objects around new path areas that don't have coverage yet
+function extendEnvironmentAlongPath(newPath) {
+    const MIN_DIST = 60;
+    const existingPositions = [];
+    sceneObjects.forEach(obj => {
+        if (obj.userData._isGround) return;
+        existingPositions.push([obj.position.x, obj.position.z]);
+    });
+
+    const fillKeywords = ['tree', 'pine', 'bush', 'rock'];
+    let added = 0;
+
+    for (const [px, , pz] of newPath) {
+        // Spawn objects on both sides of the path at this waypoint
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const side = attempt % 2 === 0 ? -1 : 1;
+            const offsetX = side * (120 + Math.random() * 250);
+            const offsetZ = (Math.random() - 0.5) * 200;
+            const fx = px + offsetX;
+            const fz = (pz || 0) + offsetZ;
+
+            // Check distance from existing objects
+            let tooClose = false;
+            for (const [ex, ez] of existingPositions) {
+                if (Math.sqrt((fx - ex) ** 2 + (fz - ez) ** 2) < MIN_DIST) {
+                    tooClose = true; break;
+                }
+            }
+            // Check distance from path
+            for (const [ppx, , ppz] of newPath) {
+                if (Math.sqrt((fx - ppx) ** 2 + (fz - (ppz||0)) ** 2) < 100) {
+                    tooClose = true; break;
+                }
+            }
+            if (tooClose) continue;
+
+            existingPositions.push([fx, fz]);
+            const kw = fillKeywords[Math.floor(Math.random() * fillKeywords.length)];
+            const scale = kw === 'rock' ? 15 + Math.random() * 15
+                : kw === 'bush' ? 25 + Math.random() * 15
+                : 120 + Math.random() * 40;
+
+            const proc = tryProceduralModel(kw, scale);
+            if (proc) {
+                proc.position.set(fx, 0, fz);
+                proc.rotation.y = Math.random() * Math.PI * 2;
+                scene.add(proc);
+                sceneObjects.push(proc);
+                added++;
+            }
+        }
+    }
+    if (added > 0) log(`Extended environment (${added} objects)`, 'scene');
+}
+
+function updatePathVisualization(charPath) {
+    // Remove old path
+    if (pathLine) { scene.remove(pathLine); pathLine = null; }
+    if (!charPath || charPath.length < 2) return;
+
+    const group = new THREE.Group();
+
+    // Main path line
+    const baseY = charPath[0]?.[1] || 94;
+    const points = charPath.map(p => {
+        const elevation = (p[1] || 94) - baseY; // height relative to baseline
+        return new THREE.Vector3(p[0], elevation + 3, p[2] || 0); // slightly above terrain
+    });
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+    const lineMat = new THREE.LineBasicMaterial({ color: 0x7c5cbf, linewidth: 2 });
+    const line = new THREE.Line(lineGeo, lineMat);
+    group.add(line);
+
+    // Dashed ground shadow of the path
+    const shadowPoints = charPath.map(p => {
+        const elevation = (p[1] || 94) - baseY;
+        return new THREE.Vector3(p[0], elevation + 0.5, p[2] || 0);
+    });
+    const shadowGeo = new THREE.BufferGeometry().setFromPoints(shadowPoints);
+    const shadowMat = new THREE.LineDashedMaterial({ color: 0x7c5cbf, dashSize: 8, gapSize: 6, opacity: 0.3, transparent: true });
+    const shadowLine = new THREE.Line(shadowGeo, shadowMat);
+    shadowLine.computeLineDistances();
+    group.add(shadowLine);
+
+    // Waypoint markers
+    const markerGeo = new THREE.SphereGeometry(3, 8, 6);
+    const markerMat = new THREE.MeshStandardMaterial({ color: 0x7c5cbf, emissive: 0x4a3080, emissiveIntensity: 0.3 });
+    charPath.forEach((p, i) => {
+        const marker = new THREE.Mesh(markerGeo, markerMat);
+        const elev = (p[1] || 94) - baseY;
+        marker.position.set(p[0], elev + 3, p[2] || 0);
+        group.add(marker);
+
+        // Start/end labels — larger markers
+        if (i === 0 || i === charPath.length - 1) {
+            const big = new THREE.Mesh(
+                new THREE.SphereGeometry(5, 10, 8),
+                new THREE.MeshStandardMaterial({
+                    color: i === 0 ? 0x2d8a4e : 0xc53030,
+                    emissive: i === 0 ? 0x1a5530 : 0x801a1a,
+                    emissiveIntensity: 0.4
+                })
+            );
+            const bigElev = (p[1] || 94) - baseY;
+            big.position.set(p[0], bigElev + 5, p[2] || 0);
+            group.add(big);
+        }
+    });
+
+    // Direction arrows along the path
+    const arrowMat = new THREE.MeshStandardMaterial({ color: 0x7c5cbf });
+    for (let i = 0; i < points.length - 1; i += 2) {
+        const from = points[i], to = points[Math.min(i + 1, points.length - 1)];
+        const dir = new THREE.Vector3().subVectors(to, from);
+        if (dir.length() < 5) continue;
+        const mid = new THREE.Vector3().lerpVectors(from, to, 0.5);
+        const arrow = new THREE.Mesh(new THREE.ConeGeometry(2.5, 8, 4), arrowMat);
+        arrow.position.copy(mid);
+        arrow.position.y = 3;
+        arrow.lookAt(to);
+        arrow.rotateX(Math.PI / 2);
+        group.add(arrow);
+    }
+
+    group.visible = pathVisible;
+    pathLine = group;
+    scene.add(group);
+}
+
+function togglePath() {
+    pathVisible = !pathVisible;
+    if (pathLine) pathLine.visible = pathVisible;
+    const btn = document.getElementById('path-toggle');
+    btn.classList.toggle('active', pathVisible);
+    btn.textContent = pathVisible ? 'Hide Path' : 'Show Path';
+}
+document.getElementById('path-toggle').addEventListener('click', togglePath);
+
+// ========== BOUNDING BOX DEBUG ==========
+let bboxHelpers = [];
+let bboxVisible = false;
+
+function showBoundingBoxes() {
+    // Clear old
+    bboxHelpers.forEach(h => scene.remove(h));
+    bboxHelpers = [];
+
+    for (const obj of sceneObjects) {
+        if (obj.userData._isGround) continue;
+        if (!obj.isGroup && !obj.isMesh && !obj.children?.length) continue;
+
+        const box = new THREE.Box3().setFromObject(obj);
+        if (box.isEmpty()) continue;
+
+        const helper = new THREE.Box3Helper(box, 0x00ff88);
+        helper.userData._isBbox = true;
+        scene.add(helper);
+        bboxHelpers.push(helper);
+    }
+}
+
+function toggleBBox() {
+    bboxVisible = !bboxVisible;
+    if (bboxVisible) {
+        showBoundingBoxes();
+    } else {
+        bboxHelpers.forEach(h => scene.remove(h));
+        bboxHelpers = [];
+    }
+    const bboxBtn = document.getElementById('bbox-toggle');
+    if (bboxBtn) bboxBtn.classList.toggle('active', bboxVisible);
+}
+const bboxBtn = document.getElementById('bbox-toggle');
+if (bboxBtn) bboxBtn.addEventListener('click', toggleBBox);
+
+// ========== PROCEDURAL FALLBACK MODELS ==========
+// Used when Poly Pizza doesn't have a good match
+
+function _mat(color, opts = {}) {
+    return new THREE.MeshStandardMaterial({ color, roughness: opts.r || 0.8, metalness: opts.m || 0, emissive: opts.e || 0, emissiveIntensity: opts.ei || 0 });
+}
+
+function makeTrainingDummy(h) {
+    const g = new THREE.Group();
+    const wood = _mat(0x8B6914);
+    // Base
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(12, 14, h * 0.05, 12), _mat(0x5C3A1E));
+    base.position.y = h * 0.025;
+    g.add(base);
+    // Main post
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(4, 5, h * 0.7, 10), wood);
+    post.position.y = h * 0.4;
+    g.add(post);
+    // Head target (padded cylinder)
+    const head = new THREE.Mesh(new THREE.SphereGeometry(8, 12, 10), _mat(0xcc3333));
+    head.position.y = h * 0.85;
+    g.add(head);
+    // Cross arms at different heights
+    for (let i = 0; i < 3; i++) {
+        const arm = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, 25, 8), wood);
+        arm.rotation.z = Math.PI / 2;
+        arm.rotation.y = i * 1.2;
+        arm.position.y = h * 0.4 + i * h * 0.15;
+        arm.position.x = (i % 2 === 0 ? 1 : -1) * 5;
+        g.add(arm);
+        // Pad on arm end
+        const pad = new THREE.Mesh(new THREE.CylinderGeometry(3.5, 3.5, 6, 8), _mat(0xcc3333));
+        pad.rotation.z = Math.PI / 2;
+        pad.rotation.y = i * 1.2;
+        pad.position.set(arm.position.x + (i % 2 === 0 ? 14 : -14), arm.position.y, 0);
+        g.add(pad);
+    }
+    return g;
+}
+
+function makeTatamiMat(h) {
+    const g = new THREE.Group();
+    // Large floor mat with tatami texture pattern
+    const size = 250;
+    const base = new THREE.Mesh(new THREE.BoxGeometry(size, 3, size), _mat(0xC2B280));
+    base.position.y = 1.5;
+    g.add(base);
+    // Individual tatami rectangles with borders
+    const matW = size / 3 - 2, matD = size / 3 - 2;
+    for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+            const border = new THREE.Mesh(new THREE.BoxGeometry(matW, 0.5, matD),
+                _mat(r % 2 === c % 2 ? 0xB8A870 : 0xC4B888));
+            border.position.set(-size/3 + c * (size/3), 3.5, -size/3 + r * (size/3));
+            g.add(border);
+            // Edge trim
+            const trim = new THREE.Mesh(new THREE.BoxGeometry(matW, 1, 2), _mat(0x2d4a1e));
+            trim.position.set(border.position.x, 3.5, border.position.z - matD/2);
+            g.add(trim);
+        }
+    }
+    return g;
+}
+
+function makePunchingBag(h) {
+    const g = new THREE.Group();
+    // Ceiling mount bracket
+    const bracket = new THREE.Mesh(new THREE.BoxGeometry(8, 3, 8), _mat(0x555555, {m: 0.8}));
+    bracket.position.y = h;
+    g.add(bracket);
+    // Chains (3 of them)
+    for (let i = 0; i < 3; i++) {
+        const angle = (i / 3) * Math.PI * 2;
+        const chain = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, h * 0.2, 4), _mat(0x888888, {m: 0.8}));
+        chain.position.set(Math.cos(angle) * 3, h * 0.88, Math.sin(angle) * 3);
+        g.add(chain);
+    }
+    // Bag body (tapered cylinder + rounded bottom)
+    const bag = new THREE.Mesh(new THREE.CylinderGeometry(11, 9, h * 0.55, 16), _mat(0x8B1A1A));
+    bag.position.y = h * 0.52;
+    g.add(bag);
+    const bottom = new THREE.Mesh(new THREE.SphereGeometry(9, 16, 8), _mat(0x8B1A1A));
+    bottom.scale.y = 0.5;
+    bottom.position.y = h * 0.24;
+    g.add(bottom);
+    // Stitching lines
+    for (let i = 0; i < 4; i++) {
+        const stitch = new THREE.Mesh(new THREE.BoxGeometry(0.5, h * 0.5, 0.5), _mat(0x440000));
+        const a = (i / 4) * Math.PI * 2;
+        stitch.position.set(Math.cos(a) * 10.5, h * 0.52, Math.sin(a) * 10.5);
+        g.add(stitch);
+    }
+    return g;
+}
+
+function makeLantern(h) {
+    const g = new THREE.Group();
+    // Hanging cord
+    const cord = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, h * 0.15, 4), _mat(0x333333));
+    cord.position.y = h * 0.93;
+    g.add(cord);
+    // Top cap
+    const topCap = new THREE.Mesh(new THREE.CylinderGeometry(h * 0.12, h * 0.18, h * 0.08, 6), _mat(0x222222));
+    topCap.position.y = h * 0.82;
+    g.add(topCap);
+    // Paper body (glowing)
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(h * 0.2, h * 0.18, h * 0.5, 12),
+        _mat(0xdd4444, {e: 0xff6633, ei: 0.4}));
+    body.position.y = h * 0.55;
+    g.add(body);
+    // Ribs
+    for (let i = 0; i < 4; i++) {
+        const rib = new THREE.Mesh(new THREE.BoxGeometry(0.8, h * 0.5, 0.8), _mat(0x5C3A1E));
+        const a = (i / 4) * Math.PI * 2;
+        rib.position.set(Math.cos(a) * h * 0.19, h * 0.55, Math.sin(a) * h * 0.19);
+        g.add(rib);
+    }
+    // Bottom cap
+    const botCap = new THREE.Mesh(new THREE.CylinderGeometry(h * 0.15, h * 0.08, h * 0.06, 6), _mat(0x222222));
+    botCap.position.y = h * 0.28;
+    g.add(botCap);
+    // Tassel
+    const tassel = new THREE.Mesh(new THREE.ConeGeometry(2, h * 0.1, 6), _mat(0xcc2222));
+    tassel.position.y = h * 0.2;
+    tassel.rotation.x = Math.PI;
+    g.add(tassel);
+    return g;
+}
+
+function makeWeaponRack(h) {
+    const g = new THREE.Group();
+    const wood = _mat(0x5C3A1E);
+    // Vertical posts
+    const postL = new THREE.Mesh(new THREE.BoxGeometry(4, h, 4), wood);
+    postL.position.set(-25, h/2, 0);
+    g.add(postL);
+    const postR = new THREE.Mesh(new THREE.BoxGeometry(4, h, 4), wood);
+    postR.position.set(25, h/2, 0);
+    g.add(postR);
+    // Horizontal supports
+    for (let i = 0; i < 3; i++) {
+        const support = new THREE.Mesh(new THREE.BoxGeometry(54, 3, 6), wood);
+        support.position.y = h * 0.2 + i * h * 0.3;
+        g.add(support);
+        // Weapon on each shelf
+        const weaponColor = [0xaa8844, 0x666666, 0x8B6914][i];
+        const weapon = new THREE.Mesh(new THREE.CylinderGeometry(1, 1.2, 45, 6), _mat(weaponColor));
+        weapon.rotation.z = Math.PI / 2;
+        weapon.position.set(0, h * 0.25 + i * h * 0.3, 5);
+        g.add(weapon);
+    }
+    // Top ornament
+    const orn = new THREE.Mesh(new THREE.BoxGeometry(58, 3, 8), _mat(0x3a2210));
+    orn.position.y = h * 0.95;
+    g.add(orn);
+    return g;
+}
+
+function makeCushion(h) {
+    const g = new THREE.Group();
+    // Round meditation cushion (zafu)
+    const cushion = new THREE.Mesh(new THREE.CylinderGeometry(14, 16, h * 0.4, 16), _mat(0x4a0080));
+    cushion.position.y = h * 0.2;
+    g.add(cushion);
+    // Pleated sides
+    for (let i = 0; i < 12; i++) {
+        const pleat = new THREE.Mesh(new THREE.BoxGeometry(1, h * 0.35, 3), _mat(0x3a0060));
+        const a = (i / 12) * Math.PI * 2;
+        pleat.position.set(Math.cos(a) * 14.5, h * 0.2, Math.sin(a) * 14.5);
+        pleat.rotation.y = -a;
+        g.add(pleat);
+    }
+    // Flat mat underneath (zabuton)
+    const mat = new THREE.Mesh(new THREE.BoxGeometry(40, 3, 40), _mat(0x222244));
+    mat.position.y = 1.5;
+    g.add(mat);
+    return g;
+}
+
+function makeShoji(h) {
+    const g = new THREE.Group();
+    const wood = _mat(0x8B7355);
+    const paper = _mat(0xF5F0E0, {e: 0xFFEECC, ei: 0.1});
+    // Outer frame
+    const frameL = new THREE.Mesh(new THREE.BoxGeometry(3, h, 3), wood);
+    frameL.position.set(-40, h/2, 0); g.add(frameL);
+    const frameR = new THREE.Mesh(new THREE.BoxGeometry(3, h, 3), wood);
+    frameR.position.set(40, h/2, 0); g.add(frameR);
+    const frameT = new THREE.Mesh(new THREE.BoxGeometry(83, 3, 3), wood);
+    frameT.position.set(0, h - 1.5, 0); g.add(frameT);
+    const frameB = new THREE.Mesh(new THREE.BoxGeometry(83, 3, 3), wood);
+    frameB.position.set(0, 1.5, 0); g.add(frameB);
+    // Inner grid (3x4 panels)
+    for (let c = 0; c < 3; c++) {
+        for (let r = 0; r < 4; r++) {
+            const pw = 24, ph = h * 0.22;
+            const panel = new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), paper);
+            panel.position.set(-25 + c * 25, h * 0.15 + r * h * 0.23, 0.5);
+            g.add(panel);
+            const panelB = panel.clone();
+            panelB.position.z = -0.5;
+            panelB.rotation.y = Math.PI;
+            g.add(panelB);
+        }
+        // Vertical divider
+        if (c < 2) {
+            const div = new THREE.Mesh(new THREE.BoxGeometry(2, h - 6, 2), wood);
+            div.position.set(-13 + c * 25, h/2, 0);
+            g.add(div);
+        }
+    }
+    // Horizontal dividers
+    for (let r = 1; r < 4; r++) {
+        const hdiv = new THREE.Mesh(new THREE.BoxGeometry(77, 2, 2), wood);
+        hdiv.position.set(0, h * 0.14 + r * h * 0.23 - h * 0.11, 0);
+        g.add(hdiv);
+    }
+    return g;
+}
+
+function makeScroll(h) {
+    const g = new THREE.Group();
+    // Hanging scroll (kakejiku)
+    const scrollBody = new THREE.Mesh(new THREE.PlaneGeometry(h * 0.4, h * 0.8),
+        _mat(0xF5F0E0, {e: 0xFFEECC, ei: 0.05}));
+    scrollBody.position.y = h * 0.5;
+    g.add(scrollBody);
+    // Top roller
+    const topRoll = new THREE.Mesh(new THREE.CylinderGeometry(2, 2, h * 0.45, 8), _mat(0x3a2210));
+    topRoll.rotation.z = Math.PI / 2;
+    topRoll.position.y = h * 0.92;
+    g.add(topRoll);
+    // Bottom roller
+    const botRoll = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, h * 0.48, 8), _mat(0x3a2210));
+    botRoll.rotation.z = Math.PI / 2;
+    botRoll.position.y = h * 0.1;
+    g.add(botRoll);
+    // Calligraphy mark (simple rectangle as character)
+    const mark = new THREE.Mesh(new THREE.PlaneGeometry(h * 0.15, h * 0.3), _mat(0x111111));
+    mark.position.set(0, h * 0.5, 0.3);
+    g.add(mark);
+    return g;
+}
+
+function makeGenericBox(h, color) {
+    const g = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(h * 0.6, h, h * 0.6), _mat(color || 0x888888));
+    mesh.position.y = h / 2;
+    g.add(mesh);
+    return g;
+}
+
+// Keywords that should use procedural fallback instead of Poly Pizza
+// Basic nature procedural models (used for fill and welcome scene)
+function makeTree(h) {
+    const g = new THREE.Group();
+    // Trunk
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(h*0.04, h*0.06, h*0.45, 6), _mat(0x6B4226));
+    trunk.position.y = h * 0.22;
+    g.add(trunk);
+    // Foliage layers (3 cones stacked)
+    const leafMat = _mat(0x3a7a2a);
+    for (let i = 0; i < 3; i++) {
+        const r = h * (0.25 - i * 0.05);
+        const cone = new THREE.Mesh(new THREE.ConeGeometry(r, h * 0.28, 7), leafMat);
+        cone.position.y = h * (0.42 + i * 0.18);
+        g.add(cone);
+    }
+    return g;
+}
+
+function makePine(h) {
+    const g = new THREE.Group();
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(h*0.03, h*0.05, h*0.5, 5), _mat(0x5C3A1E));
+    trunk.position.y = h * 0.25;
+    g.add(trunk);
+    // Tall narrow pine shape (4 cones)
+    const leafMat = _mat(0x2d5a1e);
+    for (let i = 0; i < 4; i++) {
+        const r = h * (0.18 - i * 0.03);
+        const cone = new THREE.Mesh(new THREE.ConeGeometry(r, h * 0.22, 6), leafMat);
+        cone.position.y = h * (0.4 + i * 0.15);
+        g.add(cone);
+    }
+    return g;
+}
+
+function makeBush(h) {
+    h = Math.min(h, 20);
+    const g = new THREE.Group();
+    const mat = _mat(0x4a8a3a);
+    // Cluster of spheres
+    for (let i = 0; i < 3; i++) {
+        const s = new THREE.Mesh(new THREE.SphereGeometry(h * (0.35 + Math.random() * 0.15), 7, 5), mat);
+        s.position.set((Math.random() - 0.5) * h * 0.3, h * 0.3, (Math.random() - 0.5) * h * 0.3);
+        g.add(s);
+    }
+    return g;
+}
+
+function makeRock(h) {
+    const g = new THREE.Group();
+    const geo = new THREE.DodecahedronGeometry(h * 0.4, 1);
+    // Slightly deform vertices for organic look
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+        pos.setY(i, pos.getY(i) * 0.6);
+        pos.setX(i, pos.getX(i) * (0.8 + Math.random() * 0.4));
+        pos.setZ(i, pos.getZ(i) * (0.8 + Math.random() * 0.4));
+    }
+    geo.computeVertexNormals();
+    const rock = new THREE.Mesh(geo, _mat(0x888078));
+    rock.position.y = h * 0.2;
+    g.add(rock);
+    return g;
+}
+
+const PROCEDURAL_KEYWORDS = {
+    'tree': makeTree,
+    'oak': makeTree,
+    'oak tree': makeTree,
+    'willow': makeTree,
+    'pine': makePine,
+    'pine tree': makePine,
+    'bush': makeBush,
+    'flowering bush': makeBush,
+    'rock': makeRock,
+    'boulder': makeRock,
+    'training dummy': makeTrainingDummy,
+    'dummy': makeTrainingDummy,
+    'punching bag': makePunchingBag,
+    'heavy bag': makePunchingBag,
+    'tatami': makeTatamiMat,
+    'tatami mat': makeTatamiMat,
+    'lantern': makeLantern,
+    'paper lantern': makeLantern,
+    'weapon rack': makeWeaponRack,
+    'rack': makeWeaponRack,
+    'cushion': makeCushion,
+    'meditation cushion': makeCushion,
+    'shoji': makeShoji,
+    'shoji screen': makeShoji,
+    'scroll': makeScroll,
+    'calligraphy': makeScroll,
+    'banner': makeScroll,
+};
+
+function tryProceduralModel(keyword, height) {
+    const kw = keyword.toLowerCase();
+    for (const [key, builder] of Object.entries(PROCEDURAL_KEYWORDS)) {
+        if (kw.includes(key)) return builder(height);
+    }
+    return null;
+}
+
+// Poly Pizza model fetching + GLB loading (with client-side layout for positioning)
+const polyCache = {};
+const modelCache = {};
+
+// DISABLED: Poly Pizza model fetching — replaced by Nanobanana + Trellis pipeline
+// Pre-generated GLB models are served from local /models/ folder
+// Map keywords to local model files — multiple keywords per model
+const MODEL_MAP = {
+    'tree': ['tree','oak','maple','willow','birch','elm','pine','spruce','fir','palm','cypress'],
+    'bush': ['bush','shrub','hedge','plant','fern'],
+    'rock': ['rock','boulder','stone','pebble'],
+    'building': ['building','apartment','office','skyscraper','tower','warehouse','factory','hospital','school','museum','library','hotel','cinema'],
+    'house': ['house','cottage','cabin','hut','villa','home','bungalow'],
+    'shop': ['shop','store','cafe','bakery','restaurant','pizzeria','pharmacy','market','bar'],
+    'car': ['car','sedan','taxi','vehicle','automobile'],
+    'truck': ['truck','van','bus','pickup','ambulance'],
+    'street_lamp': ['lamp','lamppost','street lamp','light','pole','streetlight','floor lamp'],
+    'bench': ['bench','park bench','seat'],
+    'hydrant': ['hydrant','fire hydrant'],
+    'trash_can': ['trash','trash can','dumpster','bin','garbage'],
+    'sofa': ['sofa','couch','armchair','loveseat','sectional'],
+    'bookshelf': ['bookshelf','shelf','bookcase','cabinet'],
+    'table': ['table','desk','counter','coffee table'],
+    'lamp': ['lamp','lantern','candle','torch'],
+    'chair': ['chair','stool','ottoman'],
+    'statue': ['statue','sculpture','monument','figure'],
+    'fountain': ['fountain','well','birdbath','pond'],
+    'barrel': ['barrel','crate','box','container','wooden crate'],
+    // New models
+    'fence_post': ['fence','fence post','railing'],
+    'mailbox': ['mailbox','mail','postbox'],
+    'stop_sign': ['stop sign','sign','road sign'],
+    'traffic_cone': ['cone','traffic cone','pylon'],
+    'dumpster': ['dumpster','skip'],
+    'picnic_table': ['picnic table','picnic','outdoor table'],
+    'swing_set': ['swing','swing set','playground'],
+    'slide': ['slide','playground slide'],
+    'gazebo': ['gazebo','pavilion','pergola'],
+    'bridge': ['bridge','overpass','footbridge'],
+    'boat': ['boat','canoe','kayak','ship'],
+    'motorcycle': ['motorcycle','motorbike','scooter'],
+    'bicycle': ['bicycle','bike','cycle'],
+    'castle': ['castle','fortress','keep'],
+    'windmill': ['windmill','mill'],
+    'tent': ['tent','camping','canopy'],
+    'campfire': ['campfire','fire','bonfire'],
+    'log': ['log','fallen tree','timber'],
+    'grave_tombstone': ['grave','tombstone','gravestone','headstone','cemetery'],
+    'pumpkin': ['pumpkin','jack o lantern','gourd'],
+    'soccer_goal': ['soccer goal','goal','goalpost','football goal'],
+    'basketball_hoop': ['basketball hoop','basketball','hoop','backboard'],
+    'punching_bag': ['punching bag','heavy bag','boxing bag'],
+    'treadmill': ['treadmill','exercise','gym equipment'],
+    'piano': ['piano','grand piano','keyboard'],
+    'bed': ['bed','mattress','bedroom'],
+    'bathtub': ['bathtub','tub','bath'],
+    'toilet': ['toilet','bathroom','wc'],
+    'refrigerator': ['refrigerator','fridge','freezer'],
+    'oven': ['oven','stove','range','cooker'],
+    'television': ['television','tv','monitor','screen'],
+    'computer_desk': ['computer desk','workstation','pc desk'],
+    'office_chair': ['office chair','swivel chair','desk chair'],
+    'filing_cabinet': ['filing cabinet','file cabinet','drawer'],
+    'vending_machine': ['vending machine','vending','snack machine'],
+    'phone_booth': ['phone booth','telephone','call box'],
+    'bus_stop_shelter': ['bus stop','bus shelter','transit stop'],
+    'water_tower': ['water tower','tower tank'],
+    'satellite_dish': ['satellite dish','dish','antenna','satellite'],
+    'crane': ['crane','construction crane','tower crane'],
+    'forklift': ['forklift','lift truck','pallet jack'],
+    'shopping_cart': ['shopping cart','cart','trolley'],
+    'streetlight': ['streetlight','street light','lamp post'],
+    'park_fountain': ['park fountain','water fountain'],
+    'bird_bath': ['bird bath','birdbath'],
+    'dog_house': ['dog house','kennel','doghouse'],
+    'wheelbarrow': ['wheelbarrow','barrow'],
+    'hay_bale': ['hay bale','hay','straw bale'],
+    'tractor': ['tractor','farm vehicle','harvester'],
+    'hot_dog_cart': ['hot dog cart','food cart','street food'],
+    'ice_cream_truck': ['ice cream truck','ice cream van'],
+    'police_car': ['police car','cop car','patrol car'],
+    'taxi_cab': ['taxi','taxi cab','cab','yellow cab'],
+};
+
+// Build reverse lookup: keyword -> filename
+const KEYWORD_TO_FILE = {};
+for (const [file, keywords] of Object.entries(MODEL_MAP)) {
+    for (const kw of keywords) {
+        KEYWORD_TO_FILE[kw] = `models/${file}.glb`;
+    }
+}
+
+async function fetchPolyModel(keyword, category) {
+    const kw = keyword.toLowerCase().trim();
+    // Exact match
+    if (KEYWORD_TO_FILE[kw]) return KEYWORD_TO_FILE[kw];
+    // Partial match — check if any mapped keyword is contained in the request
+    for (const [mapped, file] of Object.entries(KEYWORD_TO_FILE)) {
+        if (kw.includes(mapped) || mapped.includes(kw)) return file;
+    }
+    return null;
+}
+
+async function loadGLBModel(url, position, targetHeight, rotationY) {
+    return new Promise((resolve) => {
+        gltfLoader.load(url, (gltf) => {
+            const model = gltf.scene;
+            // Only hide untextured meshes that are pure white or very dark (Trellis artifacts)
+            // Textured meshes (with .map) should never be hidden
+            model.traverse(child => {
+                if (child.isMesh && child.material && !child.material.map) {
+                    const c = child.material.color;
+                    if (!c) return;
+                    if (c.r > 0.95 && c.g > 0.95 && c.b > 0.95) child.visible = false;
+                    if (c.r < 0.08 && c.g < 0.08 && c.b < 0.08) child.visible = false;
+                }
+            });
+            const box = new THREE.Box3().setFromObject(model);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const s = targetHeight / (size.y || 1);
+            model.scale.setScalar(s);
+            const scaledBox = new THREE.Box3().setFromObject(model);
+            model.position.set(position[0], position[1] - scaledBox.min.y, position[2]);
+            if (rotationY) model.rotation.y = rotationY;
+            scene.add(model);
+            sceneObjects.push(model);
+            resolve(model);
+        }, undefined, (err) => { console.error('GLB load error:', err); resolve(null); });
+    });
+}
+
+// Client-side layout engine — positions objects based on size and character path
+const BANNED = ['fence','gate','wall','barrier','shelter','bus stop','bus shelter','canopy','awning','stop sign','road barrier','barricade'];
+
+// Outdoor objects that should NEVER appear indoors
+const OUTDOOR_ONLY = ['building','apartment','skyscraper','tower','factory','warehouse','church','castle','hotel','hospital','school','museum','house','cottage','cabin','car','sedan','truck','bus','taxi','van','ambulance','motorcycle','bicycle','scooter','boat','hydrant','mailbox','lamppost','traffic','road','highway','bridge','crane','windmill','container'];
+
+const SIZE_SCALES = {
+    outdoor: { large: 435, medium: 120, small: 60 },
+    indoor:  { large: 175, medium: 80, small: 50 }
+};
+
+function computeLayout(models, sceneType, charPath) {
+    const isIndoor = sceneType === 'indoor';
+
+    // Filter banned keywords
+    models = models.filter(m => !BANNED.some(b => m.keyword.toLowerCase().includes(b)));
+
+    // For indoor scenes, also filter out outdoor-only objects
+    if (isIndoor) {
+        models = models.filter(m => !OUTDOOR_ONLY.some(o => m.keyword.toLowerCase().includes(o)));
+    }
+
+    // Separate by size
+    const large = models.filter(m => m.size === 'large');
+    const medium = models.filter(m => m.size === 'medium');
+    const small = models.filter(m => m.size === 'small');
+    const scales = SIZE_SCALES[isIndoor ? 'indoor' : 'outdoor'];
+
+    const placed = [];
+
+    if (isIndoor) {
+        // Indoor: arrange furniture around the character in a room-like layout
+        // Back wall items (large)
+        large.forEach((m, i) => {
+            const spread = large.length > 1 ? (i / (large.length - 1) - 0.5) * 300 : 0;
+            placed.push({
+                ...m,
+                position: [spread, 0, 250],
+                scale: scales.large,
+                rotationY: 3.14 // face toward character
+            });
+        });
+
+        // Side items (medium) — alternate left and right
+        medium.forEach((m, i) => {
+            const side = i % 2 === 0 ? -1 : 1;
+            const z = 50 + (i % 3) * 80;
+            placed.push({
+                ...m,
+                position: [side * 200, 0, z],
+                scale: scales.medium,
+                rotationY: side === -1 ? 1.57 : 4.71
+            });
+        });
+
+        // Front/scattered items (small)
+        small.forEach((m, i) => {
+            const angle = (i / small.length) * Math.PI - Math.PI * 0.3;
+            const r = 120 + i * 30;
+            placed.push({
+                ...m,
+                position: [Math.cos(angle) * r, 0, Math.sin(angle) * r + 100],
+                scale: scales.small,
+                rotationY: 0
+            });
+        });
+    } else {
+        // Outdoor: compact layout — models close together so scene feels full
+        const MAP_RANGE = 500;
+
+        // Place large objects in a wide spread using golden-angle distribution
+        large.forEach((m, i) => {
+            const angle = i * 2.399963 + Math.random() * 0.3; // golden angle + jitter
+            const r = 150 + (i / Math.max(large.length, 1)) * (MAP_RANGE - 200) + Math.random() * 80;
+            placed.push({
+                ...m,
+                position: [Math.cos(angle) * r, 0, Math.sin(angle) * r],
+                scale: scales.large,
+                rotationY: Math.random() * Math.PI * 2
+            });
+        });
+
+        // Medium objects: spread across mid-range, avoid center cluster
+        medium.forEach((m, i) => {
+            const angle = i * 2.399963 + 1.2 + Math.random() * 0.4; // offset from large
+            const r = 100 + (i / Math.max(medium.length, 1)) * (MAP_RANGE - 150) + Math.random() * 80;
+            placed.push({
+                ...m,
+                position: [Math.cos(angle) * r, 0, Math.sin(angle) * r],
+                scale: scales.medium,
+                rotationY: Math.random() * Math.PI * 2
+            });
+        });
+
+        // Small objects: distribute across full range with good spacing
+        small.forEach((m, i) => {
+            const angle = i * 2.399963 + 2.5 + Math.random() * 0.5; // offset from medium
+            const r = 80 + (i / Math.max(small.length, 1)) * (MAP_RANGE - 120) + Math.random() * 60;
+            placed.push({
+                ...m,
+                position: [Math.cos(angle) * r, 0, Math.sin(angle) * r],
+                scale: scales.small,
+                rotationY: Math.random() * Math.PI * 2
+            });
+        });
+
+        // === AUTO-FILL: scatter randomly across the map, avoid character path ===
+        const fillPositions = [];
+        const MIN_FILL_DIST = 50; // min distance between fill objects
+        const PATH_FILL_CLEARANCE = 80; // clearance around character path
+
+        function canPlaceFill(x, z) {
+            // Don't place at the very center where character spawns
+            if (Math.sqrt(x * x + z * z) < 80) return false;
+            // Keep clear of character path
+            for (const [px, , pz] of charPath) {
+                const d = Math.sqrt((x - px) ** 2 + (z - pz) ** 2);
+                if (d < PATH_FILL_CLEARANCE) return false;
+            }
+            // Min spacing from other fill objects
+            for (const [fx, fz] of fillPositions) {
+                const d = Math.sqrt((x - fx) ** 2 + (z - fz) ** 2);
+                if (d < MIN_FILL_DIST) return false;
+            }
+            // Min spacing from placed scene objects
+            for (const obj of placed) {
+                const d = Math.sqrt((x - obj.position[0]) ** 2 + (z - obj.position[2]) ** 2);
+                if (d < 50) return false;
+            }
+            return true;
+        }
+
+        function addFill(x, z, kw) {
+            if (!canPlaceFill(x, z)) return false;
+            fillPositions.push([x, z]);
+            const fillScale = kw === 'rock' ? 15 + Math.random() * 15
+                : kw === 'bush' ? 25 + Math.random() * 15
+                : 120 + Math.random() * 40;
+            placed.push({
+                keyword: kw, category: 6, size: 'large',
+                position: [x, 0, z], scale: fillScale,
+                rotationY: Math.random() * Math.PI * 2, _isFill: true
+            });
+            return true;
+        }
+
+        // Scatter fill objects randomly across the map
+        const FILL_TYPES = ['tree', 'tree', 'pine', 'pine', 'bush', 'rock'];
+        const MAP_EXTENT = 550;
+        for (let i = 0; i < 60; i++) {
+            const x = (Math.random() - 0.5) * 2 * MAP_EXTENT;
+            const z = (Math.random() - 0.5) * 2 * MAP_EXTENT;
+            const kw = FILL_TYPES[Math.floor(Math.random() * FILL_TYPES.length)];
+            addFill(x, z, kw);
+        }
+    }
+
+    // Push objects away from character path (wider clearance)
+    const PATH_CLEARANCE = 100;
+    for (const obj of placed) {
+        for (const [px, , pz] of charPath) {
+            const dx = obj.position[0] - px;
+            const dz = obj.position[2] - pz;
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            if (dist < PATH_CLEARANCE && dist > 0) {
+                const push = (PATH_CLEARANCE - dist) / dist;
+                obj.position[0] += dx * push;
+                obj.position[2] += dz * push;
+            }
+        }
+    }
+
+    // Extra: clear a wide corridor in front of the character (Z > 0, near X=0)
+    for (const obj of placed) {
+        const [ox, , oz] = obj.position;
+        if (oz > -50 && oz < 300 && Math.abs(ox) < 150) {
+            // Push outward from center
+            const side = ox >= 0 ? 1 : -1;
+            obj.position[0] = side * (150 + Math.random() * 50);
+        }
+    }
+
+    // Same-keyword consistency:
+    // - Trees/shrubs: vary within 40% of each other
+    // - Everything else: exact same size
+    const keywordScales = {};
+    const TREE_KEYWORDS = ['tree','pine','oak','willow','palm','cactus'];
+    const NATURE_KEYWORDS = [...TREE_KEYWORDS, 'bush','rock','boulder','flower','mushroom','stump'];
+    for (const obj of placed) {
+        if (obj._isFill) continue;
+        const kw = obj.keyword.toLowerCase();
+        const isTree = TREE_KEYWORDS.some(n => kw.includes(n));
+
+        if (isTree) {
+            // Trees: first one sets baseline, others within ±20% (40% range)
+            if (keywordScales[kw] === undefined) {
+                keywordScales[kw] = obj.scale;
+            } else {
+                const base = keywordScales[kw];
+                obj.scale = base * (0.8 + Math.random() * 0.4);
+            }
+        } else {
+            // Everything else: exact same size
+            if (keywordScales[kw] === undefined) {
+                keywordScales[kw] = obj.scale;
+            } else {
+                obj.scale = keywordScales[kw];
+            }
+        }
+    }
+
+    // Bounding box collision resolution
+    // Trees can overlap slightly, everything else gets relocated
+    const mapRange = isIndoor ? 250 : 500;
+    function getRadius(obj) {
+        const isNature = NATURE_KEYWORDS.some(n => obj.keyword.toLowerCase().includes(n));
+        return (obj.scale || 50) * (isNature ? 0.2 : 0.4);
+    }
+    function getVolume(obj) {
+        const s = obj.scale || 50;
+        return s * s * s;
+    }
+    function isOnPath(x, z) {
+        for (const [px, , pz] of charPath) {
+            const d = Math.sqrt((x - px) ** 2 + (z - (pz || 0)) ** 2);
+            if (d < 100) return true;
+        }
+        return false;
+    }
+    function collidesWithAny(obj, others, skipIdx) {
+        const r1 = getRadius(obj);
+        for (let i = 0; i < others.length; i++) {
+            if (i === skipIdx) continue;
+            const other = others[i];
+            const r2 = getRadius(other);
+            const dx = obj.position[0] - other.position[0];
+            const dz = obj.position[2] - other.position[2];
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            const bothNature = NATURE_KEYWORDS.some(n => obj.keyword.toLowerCase().includes(n))
+                && NATURE_KEYWORDS.some(n => other.keyword.toLowerCase().includes(n));
+            if (bothNature) continue; // trees can overlap
+            if (dist < r1 + r2) return true;
+        }
+        return false;
+    }
+
+    // Find collisions and relocate the smaller object
+    const MAX_RELOCATE_ATTEMPTS = 15;
+    for (let i = 0; i < placed.length; i++) {
+        for (let j = i + 1; j < placed.length; j++) {
+            const a = placed[i], b = placed[j];
+            const aIsNature = NATURE_KEYWORDS.some(n => a.keyword.toLowerCase().includes(n));
+            const bIsNature = NATURE_KEYWORDS.some(n => b.keyword.toLowerCase().includes(n));
+            if (aIsNature && bIsNature) continue; // both nature = allow overlap
+
+            const r1 = getRadius(a), r2 = getRadius(b);
+            const dx = a.position[0] - b.position[0];
+            const dz = a.position[2] - b.position[2];
+            const dist = Math.sqrt(dx * dx + dz * dz);
+
+            if (dist < r1 + r2) {
+                // Relocate the smaller volume object
+                const smaller = getVolume(a) < getVolume(b) ? a : b;
+                const smallerIdx = smaller === a ? i : j;
+                let relocated = false;
+
+                for (let attempt = 0; attempt < MAX_RELOCATE_ATTEMPTS; attempt++) {
+                    // Random position within map range
+                    const nx = (Math.random() - 0.5) * 2 * mapRange;
+                    const nz = (Math.random() - 0.5) * 2 * mapRange;
+
+                    // Skip if on character path
+                    if (isOnPath(nx, nz)) continue;
+                    // Skip if too close to center
+                    if (Math.sqrt(nx * nx + nz * nz) < 80) continue;
+
+                    smaller.position[0] = nx;
+                    smaller.position[2] = nz;
+
+                    if (!collidesWithAny(smaller, placed, smallerIdx)) {
+                        relocated = true;
+                        break;
+                    }
+                }
+
+                // If still can't find a spot, push it far out
+                if (!relocated) {
+                    const angle = Math.random() * Math.PI * 2;
+                    smaller.position[0] = Math.cos(angle) * (mapRange - 50);
+                    smaller.position[2] = Math.sin(angle) * (mapRange - 50);
+                }
+            }
+        }
+    }
+
+    return placed;
+}
+
+async function buildScene(config) {
+    sceneObjects.forEach(obj => scene.remove(obj));
+    sceneObjects = [];
+    grid.visible = false;
+    Object.keys(polyCache).forEach(k => delete polyCache[k]);
+    Object.keys(modelCache).forEach(k => delete modelCache[k]);
+
+    // Ground created after layout so we know the world extent
+    const groundBase = (config.scene.ground && config.scene.ground.color) || '#888877';
+
+    // Lights
+    for (const light of (config.scene.lights || [])) {
+        let l;
+        const color = light.color || '#ffffff';
+        const intensity = light.intensity || 1;
+        if (light.type === 'ambient') {
+            l = new THREE.AmbientLight(color, intensity);
+        } else if (light.type === 'directional') {
+            l = new THREE.DirectionalLight(color, intensity);
+            const p = light.position || [100, 200, 100];
+            l.position.set(p[0], p[1], p[2]);
+        } else if (light.type === 'point') {
+            l = new THREE.PointLight(color, intensity, 2000);
+            const p = light.position || [0, 200, 0];
+            l.position.set(p[0], p[1], p[2]);
+        }
+        if (l) { scene.add(l); sceneObjects.push(l); }
+    }
+
+    scene.fog = null;
+    scene.background = new THREE.Color(0xd8d8d0);
+
+    // Layout engine: Gemini picks objects, code positions them
+    const charPath = config._characterPath || [[0, 0]];
+    const sceneType = config.scene.type || 'outdoor';
+    const rawModels = config.scene.models || [];
+    const placedModels = computeLayout(rawModels, sceneType, charPath);
+
+    // Size ground to match the furthest object + small margin
+    let maxExtent = 200; // minimum
+    for (const m of placedModels) {
+        const dist = Math.sqrt(m.position[0] ** 2 + m.position[2] ** 2) + (m.scale || 50);
+        if (dist > maxExtent) maxExtent = dist;
+    }
+    // Also include character path
+    for (const [px, , pz] of charPath) {
+        const dist = Math.sqrt(px * px + (pz || 0) * (pz || 0)) + 100;
+        if (dist > maxExtent) maxExtent = dist;
+    }
+    const groundSize = maxExtent * 2 + 100; // diameter + margin
+    groundMesh = createTexturedGround(groundSize, groundBase);
+    groundMesh.userData._isGround = true;
+    scene.add(groundMesh);
+    sceneObjects.push(groundMesh);
+
+    // Place loading placeholders at computed positions BEFORE loading models
+    const placeholders = [];
+    const phMat = new THREE.MeshStandardMaterial({
+        color: 0x7c5cbf, transparent: true, opacity: 0.2, roughness: 1
+    });
+    placedModels.forEach(m => {
+        if (m._isFill) return; // No placeholders for background fill
+        const h = m.scale || 100;
+        const phGeo = new THREE.BoxGeometry(h * 0.4, h, h * 0.4);
+        const ph = new THREE.Mesh(phGeo, phMat.clone());
+        ph.position.set(m.position[0], h / 2, m.position[2]);
+        // Pulse animation via userData
+        ph.userData._phaseOffset = Math.random() * Math.PI * 2;
+        scene.add(ph);
+        placeholders.push(ph);
+    });
+
+    // Animate placeholders with pulsing
+    let phAnimId = null;
+    function animatePlaceholders() {
+        const t = Date.now() * 0.003;
+        placeholders.forEach(ph => {
+            if (ph.parent) { // still in scene
+                ph.material.opacity = 0.15 + Math.sin(t + ph.userData._phaseOffset) * 0.1;
+            }
+        });
+        phAnimId = requestAnimationFrame(animatePlaceholders);
+    }
+    if (placeholders.length > 0) animatePlaceholders();
+
+    // Load actual models, replacing placeholders
+    let phIdx = 0;
+    const mainModels = placedModels.filter(m => !m._isFill);
+    const fillModels = placedModels.filter(m => m._isFill);
+    let loadedCount = 0;
+    const totalMain = mainModels.length;
+
+    log(`Placing models... (0/${totalMain})`, 'scene', 'model-progress');
+
+    async function loadModel(m, myPhIdx) {
+        const isFill = m._isFill;
+        const procedural = tryProceduralModel(m.keyword, m.scale);
+        if (procedural) {
+            procedural.position.set(m.position[0], 0, m.position[2]);
+            if (m.rotationY) procedural.rotation.y = m.rotationY;
+            procedural.userData._keyword = m.keyword;
+            if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
+            scene.add(procedural);
+            sceneObjects.push(procedural);
+            if (!isFill) {
+                loadedCount++;
+                log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+            }
+            return;
+        }
+
+        const glbUrl = await fetchPolyModel(m.keyword, m.category);
+        if (glbUrl) {
+            const loaded = await loadGLBModel(glbUrl, m.position, m.scale, m.rotationY || 0);
+            if (loaded) loaded.userData._keyword = m.keyword;
+            if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
+            if (!isFill) {
+                loadedCount++;
+                log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+            }
+        }
+    }
+
+    // Load main models and fill models concurrently
+    let mainPhIdx = 0;
+    const loadPromises = [
+        ...mainModels.map(m => loadModel(m, mainPhIdx++)),
+        ...fillModels.map(m => loadModel(m, -1))
+    ];
+    await Promise.all(loadPromises);
+
+    log(`All ${totalMain} models placed`, 'scene', 'model-progress');
+
+    // Clean up remaining placeholders and stop animation
+    if (phAnimId) cancelAnimationFrame(phAnimId);
+    placeholders.forEach(ph => { if (ph.parent) scene.remove(ph); ph.geometry.dispose(); ph.material.dispose(); });
+}
+
+// Console logging
+const LOG_ICONS = {
+    system: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2.5" fill="white"/></svg>`,
+    agent:  `<svg width="8" height="8" viewBox="0 0 8 8"><rect x="1" y="1" width="6" height="6" rx="1" fill="white"/></svg>`,
+    success:`<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1.5 4.5L3 6 6.5 2" stroke="white" stroke-width="1.3" fill="none"/></svg>`,
+    error:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 2l4 4M6 2l-4 4" stroke="white" stroke-width="1.3"/></svg>`,
+    motion: `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 1v6l5-3z" fill="white"/></svg>`,
+    scene:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6L4 2l3 4z" fill="white"/></svg>`,
+    render: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2" fill="none" stroke="white" stroke-width="1.2"/><circle cx="4" cy="4" r="0.8" fill="white"/></svg>`,
+    path:   `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6Q4 1 7 6" stroke="white" stroke-width="1.2" fill="none"/></svg>`,
+    user:   `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="2.5" r="1.5" fill="white"/><path d="M1.5 7a2.5 2.5 0 015 0" fill="white"/></svg>`,
+    music:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M3 1v5M6 0v4.5" stroke="white" stroke-width="1.2"/><circle cx="2" cy="6" r="1.2" fill="white"/><circle cx="5" cy="5" r="1.2" fill="white"/></svg>`,
+};
+
+function log(msg, type = 'system', id = null) {
+    const console_el = document.getElementById('console');
+
+    // If an id is provided, update existing line instead of creating new one
+    if (id) {
+        const existing = document.getElementById('log-' + id);
+        if (existing) {
+            existing.querySelector('.log-msg').textContent = msg;
+            console_el.scrollTop = console_el.scrollHeight;
+            return existing;
+        }
+    }
+
+    const line = document.createElement('div');
+    line.className = `log-line log-${type}`;
+    if (id) line.id = 'log-' + id;
+
+    const icon = document.createElement('div');
+    icon.className = 'log-icon';
+    icon.innerHTML = LOG_ICONS[type] || LOG_ICONS.system;
+
+    const msgEl = document.createElement('span');
+    msgEl.className = 'log-msg';
+    msgEl.textContent = msg;
+
+    line.appendChild(icon);
+    line.appendChild(msgEl);
+    console_el.appendChild(line);
+    console_el.scrollTop = console_el.scrollHeight;
+    return line;
+}
+
+function setPill(id, active) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('active', active);
+}
+
+// Generate
+const btn = document.getElementById('generate-btn');
+const input = document.getElementById('prompt-input');
+
+let isGenerating = false;
+async function generate() {
+    const prompt = input.value.trim();
+    if (!prompt || isGenerating) return;
+    isGenerating = true;
+
+    const duration = 5; // Default duration for initial generation
+
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    document.getElementById('welcome').classList.add('hidden');
+    document.getElementById('panel').classList.remove('collapsed');
+    document.getElementById('panel-reopen').classList.remove('visible');
+
+    const shimmer = document.createElement('div');
+    shimmer.className = 'shimmer';
+    viewport.appendChild(shimmer);
+
+    log(`> "${prompt}"`, 'agent');
+    const startTime = Date.now();
+
+    try {
+        // === STEP 1: Generate motion FIRST to get character path ===
+        // Silently enhance the motion prompt for better demo results.
+        // Bias toward locomotion and exaggerated movement — never shown to user.
+        const motionPrompt = enhanceMotionPrompt(prompt);
+
+        setPill('pill-motion', true);
+        log(`Generating motion (${duration}s)...`, 'motion');
+
+        const MIN_TRAVEL_DIST = 50; // minimum distance between start and end
+        const MAX_RETRIES = 3;
+        let bvhText = null;
+        let characterPath = null;
+
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            const motionStart = Date.now();
+            const motionRes = await fetch(`${API}/generate-motion`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt: motionPrompt, duration })
+            });
+            if (!motionRes.ok) throw new Error((await motionRes.json()).error || 'Motion failed');
+            bvhText = await motionRes.text();
+
+            const motionElapsed = ((Date.now() - motionStart) / 1000).toFixed(1);
+
+            // Check if character actually moved
+            const { path } = extractPathFromBVH(bvhText);
+            characterPath = path;
+
+            if (path.length >= 2) {
+                const startPt = path[0];
+                const endPt = path[path.length - 1];
+                const travelDist = Math.sqrt(
+                    (endPt[0] - startPt[0]) ** 2 + (endPt[1] - startPt[1]) ** 2
+                );
+
+                if (travelDist >= MIN_TRAVEL_DIST || attempt === MAX_RETRIES) {
+                    log(`Motion received (${(bvhText.length / 1024).toFixed(0)}KB, ${motionElapsed}s)`, 'motion');
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        setPill('pill-motion', false);
+        log(`Extracted ${characterPath.length} waypoints`, 'path');
+
+        // === STEP 3: Plan scene AROUND the path ===
+        setPill('pill-scene', true);
+        log('Planning scene layout...', 'scene');
+
+        const config = await callGemini(prompt, characterPath);
+        config._characterPath = characterPath;
+        const geminiElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const modelCount = (config.scene.models || []).length;
+        log(`Planned ${modelCount} models (${geminiElapsed}s)`, 'scene');
+
+        // === STEP 4: Build scene + load animation ===
+        await buildScene(config);
+        log('Scene built', 'scene');
+        setPill('pill-scene', false);
+
+        setPill('pill-render', true);
+        log('Loading animation...', 'render');
+        loadBVH(bvhText);
+        lastBvhText = bvhText;
+
+        // Build path visualization and apply terrain
+        updatePathVisualization(characterPath);
+        if (groundMesh) applyTerrainFromPath(groundMesh, characterPath);
+        pathVisible = false;
+        if (pathLine) pathLine.visible = false;
+        const pathBtn = document.getElementById('path-toggle');
+        pathBtn.style.display = '';
+        pathBtn.classList.remove('active');
+        pathBtn.textContent = 'Show Path';
+
+        // Initialize timeline with first clip
+        timelineClips = [{ prompt: prompt, duration: currentClip.duration, clip: currentClip }];
+        totalDuration = currentClip.duration;
+        renderTimelineClips();
+        showTimeline();
+        document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+        isPlaying = true;
+
+        log('Scene complete', 'render');
+        showEditor();
+        setPill('pill-render', false);
+
+        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        log(`Total generation time: ${totalElapsed}s`, 'system');
+
+        // Generate soundtrack in background (non-blocking)
+        // Music disabled during live playback — only plays during video render
+        // generateMusic(prompt);
+
+    } catch (err) {
+        log(`Error: ${err.message}`, 'error');
+        setPill('pill-scene', false);
+        setPill('pill-motion', false);
+        setPill('pill-render', false);
+    }
+
+    shimmer.remove();
+    btn.disabled = false;
+    btn.textContent = 'Generate';
+    isGenerating = false;
+}
+
+btn.addEventListener('click', generate);
+input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); generate(); }
+});
+
+// Welcome screen
+document.getElementById('logo-btn').addEventListener('click', () => {
+    document.getElementById('welcome').classList.remove('hidden');
+    document.getElementById('welcome-input').value = '';
+    document.getElementById('welcome-input').focus();
+});
+
+function dismissWelcome(prompt) {
+    input.value = prompt;
+    document.getElementById('welcome').classList.add('hidden');
+    generate();
+}
+
+document.querySelectorAll('.w-ex').forEach(card => {
+    card.addEventListener('click', () => dismissWelcome(card.dataset.prompt));
+});
+
+const welcomeInputEl = document.getElementById('welcome-input');
+const welcomeArrow = document.querySelector('.w-input-arrow');
+if (welcomeArrow) welcomeInputEl.addEventListener('input', () => {
+    welcomeArrow.classList.toggle('visible', welcomeInputEl.value.trim().length > 0);
+});
+welcomeInputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const v = e.target.value.trim();
+        if (v) dismissWelcome(v);
+    }
+});
+
+// Render loop
+const _charWorldPos = new THREE.Vector3();
+let _userOrbiting = false;
+let _orbitTimeout = null;
+controls.addEventListener('start', () => { _userOrbiting = true; clearTimeout(_orbitTimeout); });
+controls.addEventListener('end', () => { _orbitTimeout = setTimeout(() => { _userOrbiting = false; }, 2000); });
+let isRecording = false;
+let selectedClipIndex = -1;
+function animate() {
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    if (isRecording) return;
+    if (mixer && isPlaying) mixer.update(dt);
+    if (!skinnedCharMesh) updateBodyMeshes(); // capsule fallback only
+    if (timelineClips.length > 0) updatePlayhead();
+    // Keep ground centered on character
+    if (currentBones && characterGroup) {
+        currentBones.getWorldPosition(_charWorldPos);
+        if (groundMesh) {
+            groundMesh.position.x = _charWorldPos.x;
+            groundMesh.position.z = _charWorldPos.z;
+        }
+        // Extend environment when character goes far from last extension point
+        if (!window._lastExtendPos) window._lastExtendPos = new THREE.Vector3();
+        const distFromLastExtend = _charWorldPos.distanceTo(window._lastExtendPos);
+        if (distFromLastExtend > 200) {
+            window._lastExtendPos.copy(_charWorldPos);
+            const nearby = [[_charWorldPos.x, 0, _charWorldPos.z]];
+            extendEnvironmentAlongPath(nearby);
+        }
+    }
+    // Pulse selection box
+    if (selectionBox) {
+        const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
+        selectionBox.material.opacity = pulse;
+    }
+    renderer.render(scene, camera);
+}
+animate();
+
+// Initial welcome messages
+log('Kinetik v0.1', 'system');
+log('Kimodo model loaded on RunPod GPU', 'success');
+log('Type a prompt or pick a scene to start', 'system');
+
+// ========== WELCOME PREVIEW — separate mini renderer in a box ==========
+const WELCOME_MOTIONS = [
+    { file: 'assets/motions/backflip.bvh', label: 'backflip' },
+    { file: 'assets/motions/silly_dance.bvh', label: 'dancing' },
+    { file: 'assets/motions/spinning_kick.bvh', label: 'spinning kick', mirror: true },
+    { file: 'assets/motions/sneak_forward.bvh', label: 'sneaking' },
+    { file: 'assets/motions/drunk_dance.bvh', label: 'vibing' },
+];
+let welcomeMotionIdx = 0;
+let welcomeInterval = null;
+
+(function initWelcomePreview() {
+    const container = document.getElementById('w-preview');
+    if (!container) return;
+
+    // Separate scene, camera, renderer for the preview box
+    const wScene = new THREE.Scene();
+    wScene.background = new THREE.Color(0xe8e4f0);
+
+    const wCamera = new THREE.PerspectiveCamera(50, 480 / 520, 1, 2000);
+    wCamera.position.set(0, 120, 300);
+    wCamera.lookAt(0, 80, 0);
+
+    const wRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    wRenderer.setSize(480, 520);
+    wRenderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(wRenderer.domElement);
+
+    // Lights
+    wScene.add(new THREE.AmbientLight(0x606080, 2));
+    const wKey = new THREE.DirectionalLight(0xffffff, 2);
+    wKey.position.set(100, 200, 150);
+    wScene.add(wKey);
+    const wFill = new THREE.DirectionalLight(0x8888ff, 0.6);
+    wFill.position.set(-100, 100, -50);
+    wScene.add(wFill);
+
+    // Simple floor disc
+    const floorGeo = new THREE.CircleGeometry(150, 32);
+    const floorMat = new THREE.MeshStandardMaterial({ color: 0xd4d0dc, roughness: 0.9 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0;
+    wScene.add(floor);
+
+    // State
+    let wMixer = null;
+    let wBones = null;
+    let wGroup = null;
+    let wBodyMeshes = [];
+    const wClock = new THREE.Clock();
+
+    function wLoadBVH(text) {
+        // Clear previous
+        if (wGroup) wScene.remove(wGroup);
+        wBodyMeshes.forEach(m => wScene.remove(m));
+        wBodyMeshes = [];
+
+        const loader = new BVHLoader();
+        const result = loader.parse(text);
+
+        wGroup = new THREE.Group();
+        wBones = result.skeleton.bones[0];
+        wGroup.add(wBones);
+        wScene.add(wGroup);
+
+        // Create body meshes using the same LatheGeometry approach as main scene
+        const mat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.6, metalness: 0.1 });
+        const tv1 = new THREE.Vector3(), tv2 = new THREE.Vector3();
+
+        // Head
+        const headBone = findBone(wBones, 'HeadEnd');
+        const headBase = findBone(wBones, 'Head');
+        if (headBone && headBase) {
+            const hMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 16), mat.clone());
+            hMesh.userData.type = 'head';
+            hMesh.userData.bone = headBone;
+            hMesh.userData.baseBone = headBase;
+            wScene.add(hMesh);
+            wBodyMeshes.push(hMesh);
+        }
+
+        // Body segments with LatheGeometry
+        for (const [fromName, toName, rTop, rBot] of BODY_SEGMENTS) {
+            const fromBone = findBone(wBones, fromName);
+            const toBone = findBone(wBones, toName);
+            if (!fromBone || !toBone) continue;
+
+            fromBone.getWorldPosition(tv1);
+            toBone.getWorldPosition(tv2);
+            const height = Math.max(tv1.distanceTo(tv2), 1);
+            const segments = 12;
+            const capSteps = 8;
+            const points = [];
+            for (let i = 0; i <= capSteps; i++) {
+                const angle = (Math.PI / 2) * (i / capSteps);
+                points.push(new THREE.Vector2(Math.sin(angle) * rBot, -height / 2 - Math.cos(angle) * rBot + rBot));
+            }
+            points.push(new THREE.Vector2(rBot, -height / 2 + rBot));
+            points.push(new THREE.Vector2(rTop, height / 2 - rTop));
+            for (let i = 0; i <= capSteps; i++) {
+                const angle = (Math.PI / 2) * (i / capSteps);
+                points.push(new THREE.Vector2(Math.cos(angle) * rTop, height / 2 + Math.sin(angle) * rTop - rTop));
+            }
+            const geo = new THREE.LatheGeometry(points, segments);
+            const mesh = new THREE.Mesh(geo, mat.clone());
+            mesh.userData.type = 'capsule';
+            mesh.userData.fromBone = fromBone;
+            mesh.userData.toBone = toBone;
+            wScene.add(mesh);
+            wBodyMeshes.push(mesh);
+        }
+
+        // Hands
+        for (const handName of ['LeftHand', 'RightHand']) {
+            const bone = findBone(wBones, handName);
+            if (bone) {
+                const hMesh = new THREE.Mesh(new THREE.SphereGeometry(3.5, 10, 8), mat.clone());
+                hMesh.userData.type = 'joint';
+                hMesh.userData.bone = bone;
+                wScene.add(hMesh);
+                wBodyMeshes.push(hMesh);
+            }
+        }
+
+        wMixer = new THREE.AnimationMixer(wBones);
+
+        // Sample to find ground offset
+        const action = wMixer.clipAction(result.clip);
+        action.play();
+        let minY = Infinity;
+        const bp = new THREE.Vector3();
+        const dur = result.clip.duration;
+        for (let s = 0; s <= 20; s++) {
+            wMixer.update(s === 0 ? 0.0001 : dur / 20);
+            wGroup.updateMatrixWorld(true);
+            for (const fn of ['LeftFoot', 'RightFoot', 'LeftToeBase', 'RightToeBase']) {
+                const b = findBone(wBones, fn);
+                if (b) { b.getWorldPosition(bp); if (bp.y < minY) minY = bp.y; }
+            }
+        }
+        wGroup.position.y = -(minY - 2);
+        action.reset();
+        action.setLoop(THREE.LoopOnce);
+        action.clampWhenFinished = true;
+        action.play();
+        wMixer.setTime(0);
+        wClock.getDelta();
+        return dur;
+    }
+
+    // Reuse the exact same update logic as the main scene
+    function wUpdateBodyMeshes() {
+        const up = new THREE.Vector3(0, 1, 0);
+        const v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+        const mid = new THREE.Vector3(), dir = new THREE.Vector3();
+        const q = new THREE.Quaternion();
+
+        for (const mesh of wBodyMeshes) {
+            if (mesh.userData.type === 'head') {
+                mesh.userData.baseBone.getWorldPosition(v1);
+                mesh.userData.bone.getWorldPosition(v2);
+                mid.lerpVectors(v1, v2, 0.5);
+                mesh.position.copy(mid);
+                const h = v1.distanceTo(v2);
+                mesh.scale.set(7, h * 0.55, 7.5);
+                dir.subVectors(v2, v1).normalize();
+                if (dir.lengthSq() > 0.0001) { q.setFromUnitVectors(up, dir); mesh.quaternion.copy(q); }
+            } else if (mesh.userData.type === 'joint') {
+                mesh.userData.bone.getWorldPosition(v1);
+                mesh.position.copy(v1);
+            } else {
+                mesh.userData.fromBone.getWorldPosition(v1);
+                mesh.userData.toBone.getWorldPosition(v2);
+                mid.lerpVectors(v1, v2, 0.5);
+                mesh.position.copy(mid);
+                dir.subVectors(v2, v1).normalize();
+                if (dir.lengthSq() > 0.0001) { q.setFromUnitVectors(up, dir); mesh.quaternion.copy(q); }
+            }
+        }
+    }
+
+    // Render loop for preview
+    let wAnimId = null;
+    function wAnimate() {
+        wAnimId = requestAnimationFrame(wAnimate);
+        if (wMixer) wMixer.update(wClock.getDelta());
+        wUpdateBodyMeshes();
+        wRenderer.render(wScene, wCamera);
+    }
+    wAnimate();
+
+    // Schedule next motion when current clip ends
+    async function playNextWelcomeMotion() {
+        if (document.getElementById('welcome').classList.contains('hidden')) {
+            if (wAnimId) cancelAnimationFrame(wAnimId);
+            wRenderer.dispose();
+            return;
+        }
+        welcomeMotionIdx = (welcomeMotionIdx + 1) % WELCOME_MOTIONS.length;
+        const m = WELCOME_MOTIONS[welcomeMotionIdx];
+        try {
+            const r = await fetch(m.file);
+            if (r.ok) {
+                const dur = wLoadBVH(await r.text());
+                // Mirror on X if flagged
+                if (wGroup) wGroup.scale.x = m.mirror ? -1 : 1;
+                const label = document.getElementById('w-motion-label');
+                if (label) {
+                    label.style.opacity = '0';
+                    setTimeout(() => { label.textContent = m.label; label.style.opacity = '1'; }, 300);
+                }
+                // Schedule next before clip ends (cut last 0.5s of stillness)
+                setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
+            }
+        } catch(e) {}
+    }
+    // Schedule first transition after initial clip ends
+    fetch(WELCOME_MOTIONS[0].file)
+        .then(r => { console.log('Welcome BVH fetch:', r.status, r.url); return r.ok ? r.text() : null; })
+        .then(text => {
+            if (text) {
+                console.log('Welcome BVH loaded, length:', text.length);
+                try {
+                    const dur = wLoadBVH(text);
+                    console.log('Welcome BVH parsed, duration:', dur);
+                    setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
+                } catch(e) { console.error('Welcome BVH parse error:', e); }
+            } else {
+                console.error('Welcome BVH fetch returned null');
+            }
+        })
+        .catch(e => { console.error('Welcome BVH fetch failed:', e); });
+
+})();
+
+// Resize
+window.addEventListener('resize', () => {
+    camera.aspect = viewport.clientWidth / viewport.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+});
+
+// ========== TIMELINE & INTERACTION SYSTEM ==========
+const raycaster = new THREE.Raycaster();
+const ptrStart = new THREE.Vector2();
+let ptrDownTime = 0;
+
+// Track animation clips as timeline segments
+// (timelineClips and totalDuration declared with other state vars above)
+
+// Merge two AnimationClips into one continuous clip with a smooth blend transition
+function mergeClips(clipA, clipB, blendTime) {
+    blendTime = blendTime || 0.4;
+    const offsetTime = clipA.duration;
+    const mergedTracks = [];
+
+    // CRITICAL: Find root position offset so clip B continues from where clip A ended.
+    // The Hips bone has a position track with absolute XYZ — we need to offset clip B's
+    // Hips position so it starts where clip A's Hips ended.
+    const hipsTrackA = clipA.tracks.find(t => t.name.includes('Hips') && t.name.endsWith('.position'));
+    const hipsTrackB = clipB.tracks.find(t => t.name.includes('Hips') && t.name.endsWith('.position'));
+    let posOffsetX = 0, posOffsetZ = 0;
+    if (hipsTrackA && hipsTrackB) {
+        const vA = hipsTrackA.values;
+        const vB = hipsTrackB.values;
+        // End of clip A: last XYZ triplet
+        const endAx = vA[vA.length - 3], endAz = vA[vA.length - 1];
+        // Start of clip B: first XYZ triplet
+        const startBx = vB[0], startBz = vB[2];
+        posOffsetX = endAx - startBx;
+        posOffsetZ = endAz - startBz;
+    }
+
+    for (const trackA of clipA.tracks) {
+        const trackB = clipB.tracks.find(t => t.name === trackA.name);
+        if (!trackB) {
+            mergedTracks.push(trackA.clone());
+            continue;
+        }
+
+        const timesA = Array.from(trackA.times);
+        const timesB = Array.from(trackB.times).map(t => t + offsetTime);
+
+        const valuesA = Array.from(trackA.values);
+        let valuesB = Array.from(trackB.values);
+
+        const valSize = trackA.getValueSize();
+        const isPositionTrack = trackA.name.endsWith('.position');
+
+        // Offset position tracks for Hips so character doesn't teleport
+        if (isPositionTrack && trackA.name.includes('Hips') && (posOffsetX !== 0 || posOffsetZ !== 0)) {
+            for (let i = 0; i < valuesB.length; i += valSize) {
+                valuesB[i] += posOffsetX;       // X
+                valuesB[i + 2] += posOffsetZ;   // Z
+            }
+        }
+
+        // Blend keyframes at the junction for smooth transition
+        const lastA = valuesA.slice(-valSize);
+        const firstB = valuesB.slice(0, valSize);
+        const blendTimes = [offsetTime - 0.001, offsetTime + blendTime];
+        const blendVals = [];
+        blendVals.push(...lastA);
+        for (let i = 0; i < valSize; i++) {
+            blendVals.push(lastA[i] * 0.3 + firstB[i] * 0.7);
+        }
+
+        const allTimes = new Float32Array([...timesA, ...blendTimes, ...timesB]);
+        const allValues = new Float32Array([...valuesA, ...blendVals, ...valuesB]);
+
+        mergedTracks.push(new trackA.constructor(trackA.name, allTimes, allValues));
+    }
+
+    // Include any tracks only in clipB
+    for (const trackB of clipB.tracks) {
+        if (!clipA.tracks.find(t => t.name === trackB.name)) {
+            const clone = trackB.clone();
+            clone.times = new Float32Array(Array.from(clone.times).map(t => t + offsetTime));
+            mergedTracks.push(clone);
+        }
+    }
+
+    return new THREE.AnimationClip('merged', clipA.duration + clipB.duration, mergedTracks);
+}
+
+function showTimeline() {
+    document.getElementById('timeline-bar').classList.add('visible');
+}
+
+function renderTimelineClips() {
+    const container = document.getElementById('timeline-clips');
+    container.innerHTML = '';
+    timelineClips.forEach((seg, i) => {
+        const el = document.createElement('div');
+        el.className = 'timeline-clip';
+        if (i === selectedClipIndex) el.classList.add('selected');
+        const w = Math.max(80, seg.duration * 40);
+        el.style.width = w + 'px';
+        el.innerHTML = `<span>${seg.prompt}</span><span class="clip-dur">${seg.duration.toFixed(1)}s</span>`;
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Toggle selection
+            if (selectedClipIndex === i) {
+                selectedClipIndex = -1;
+            } else {
+                selectedClipIndex = i;
+            }
+            renderTimelineClips();
+            // Seek to start of this clip
+            let t = 0;
+            for (let j = 0; j < i; j++) t += timelineClips[j].duration;
+            if (mixer) { mixer.setTime(t); updateBodyMeshes(); }
+        });
+        container.appendChild(el);
+    });
+}
+
+// Rebuild merged clip from all timeline segments
+function rebuildMergedClip() {
+    if (timelineClips.length === 0) return;
+    let merged = timelineClips[0].clip;
+    for (let i = 1; i < timelineClips.length; i++) {
+        merged = mergeClips(merged, timelineClips[i].clip, 0.4);
+    }
+    mixer.stopAllAction();
+    mixer.uncacheRoot(currentBones);
+    mixer = new THREE.AnimationMixer(currentBones);
+    mixer.timeScale = 1.5;
+    currentClip = merged;
+    currentAction = mixer.clipAction(merged);
+    currentAction.play();
+    totalDuration = merged.duration;
+}
+
+function updatePlayhead() {
+    if (!mixer || totalDuration === 0) return;
+    // Loop the merged clip
+    const t = mixer.time % totalDuration;
+    const clipsEl = document.getElementById('timeline-clips');
+    const controlsEl = document.getElementById('timeline-controls');
+    // Calculate total width of just the clip blocks (not the add input)
+    let clipsWidth = 0;
+    clipsEl.querySelectorAll('.timeline-clip').forEach(el => { clipsWidth += el.offsetWidth + 4; });
+    clipsWidth = Math.max(clipsWidth, 1);
+    const offset = controlsEl.offsetWidth + 16;
+    const frac = Math.min(t / totalDuration, 1.0); // clamp to 0-1
+    const px = offset + frac * clipsWidth;
+    document.getElementById('timeline-playhead').style.left = px + 'px';
+    document.getElementById('tl-time').textContent = t.toFixed(1) + 's';
+
+    // Highlight active clip
+    let elapsed = 0;
+    document.querySelectorAll('.timeline-clip').forEach((el, i) => {
+        const seg = timelineClips[i];
+        if (seg && t >= elapsed && t < elapsed + seg.duration) {
+            el.classList.add('active');
+        } else {
+            el.classList.remove('active');
+        }
+        if (seg) elapsed += seg.duration;
+    });
+}
+
+// Click to select/delete scene objects (silent — no panel)
+renderer.domElement.addEventListener('pointerdown', (e) => {
+    ptrStart.set(e.clientX, e.clientY);
+    ptrDownTime = Date.now();
+});
+
+renderer.domElement.addEventListener('pointerup', (e) => {
+    const dx = e.clientX - ptrStart.x, dy = e.clientY - ptrStart.y;
+    if (Math.sqrt(dx*dx + dy*dy) > 5 || Date.now() - ptrDownTime > 300) return;
+
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ptr = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    raycaster.setFromCamera(ptr, camera);
+
+    const targets = [];
+    sceneObjects.forEach(obj => {
+        if (obj.userData._isGround) return; // skip ground
+        if (obj.isMesh) targets.push(obj);
+        else if (obj.isGroup || obj.children) obj.traverse(c => { if (c.isMesh) targets.push(c); });
+    });
+
+    const hits = raycaster.intersectObjects(targets, false);
+    if (hits.length > 0) {
+        let root = hits[0].object;
+        while (root.parent && !sceneObjects.includes(root)) root = root.parent;
+        if (sceneObjects.includes(root)) {
+            // Clear previous selection
+            if (selectedObject) {
+                selectedObject.traverse(c => {
+                    if (c.isMesh && c.userData._oe) c.material.emissive.copy(c.userData._oe);
+                });
+            }
+            selectedObject = root;
+            selectedType = 'scene';
+            // Purple emissive tint
+            root.traverse(c => {
+                if (c.isMesh && c.material && c.material.emissive) {
+                    c.userData._oe = c.material.emissive.clone();
+                    c.material.emissive.set(0x553399);
+                }
+            });
+            // Purple wireframe box
+            showSelectionBox(root);
+            enterBuildMode();
+        }
+    } else {
+        // Deselect
+        if (selectedObject) {
+            selectedObject.traverse(c => {
+                if (c.isMesh && c.userData._oe) c.material.emissive.copy(c.userData._oe);
+            });
+            selectedObject = null;
+            selectedType = null;
+            removeSelectionBox();
+            exitBuildMode();
+        }
+    }
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+    // Spacebar = play/pause
+    if (e.key === ' ') {
+        e.preventDefault();
+        isPlaying = !isPlaying;
+        document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+        return;
+    }
+
+    if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+
+    // Delete selected timeline clip
+    if (selectedClipIndex >= 0 && timelineClips.length > 1) {
+        timelineClips.splice(selectedClipIndex, 1);
+        selectedClipIndex = -1;
+        rebuildMergedClip();
+        renderTimelineClips();
+        return;
+    }
+
+    // Delete selected scene object
+    if (selectedObject && selectedType === 'scene') {
+        scene.remove(selectedObject);
+        const idx = sceneObjects.indexOf(selectedObject);
+        if (idx !== -1) sceneObjects.splice(idx, 1);
+        selectedObject.traverse(c => {
+            if (c.geometry) c.geometry.dispose();
+            if (c.material) (Array.isArray(c.material) ? c.material : [c.material]).forEach(m => m.dispose());
+        });
+        selectedObject = null;
+        selectedType = null;
+        removeSelectionBox();
+    }
+});
+
+// Play/Pause button
+document.getElementById('tl-playpause').addEventListener('click', () => {
+    isPlaying = !isPlaying;
+    document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+});
+
+// Deselect timeline clip when clicking outside
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.timeline-clip')) {
+        if (selectedClipIndex >= 0) {
+            selectedClipIndex = -1;
+            renderTimelineClips();
+        }
+    }
+});
+
+// ========== CHAT INTERFACE ==========
+const chatInput = document.getElementById('chat-input');
+
+// Find nearest scene object matching a keyword
+function findNearestObject(keyword) {
+    const kw = keyword.toLowerCase();
+    let best = null, bestDist = Infinity;
+    // Get character's current position
+    const charPos = new THREE.Vector3();
+    if (currentBones) currentBones.getWorldPosition(charPos);
+    for (const obj of sceneObjects) {
+        if (obj.userData._isGround) continue;
+        const objKw = (obj.userData._keyword || '').toLowerCase();
+        // Match by keyword stored in userData, or by checking child names
+        const nameMatch = objKw.includes(kw) || kw.includes(objKw);
+        if (!nameMatch && objKw) continue;
+        if (!nameMatch && !objKw) continue; // skip unknown objects
+        const d = charPos.distanceTo(obj.position);
+        if (d < bestDist) { bestDist = d; best = obj; }
+    }
+    return best;
+}
+
+// Rotate a BVH clip's root motion to face a target angle
+function rotateBVHToward(bvhText, targetAngle) {
+    const loader = new BVHLoader();
+    const result = loader.parse(bvhText);
+    const clip = result.clip;
+    const hipsTrack = clip.tracks.find(t => t.name.includes('Hips') && t.name.endsWith('.position'));
+    if (!hipsTrack) return { clip, skeleton: result.skeleton };
+
+    const v = hipsTrack.values;
+    // Compute the current direction of travel from BVH
+    const startX = v[0], startZ = v[2];
+    const endX = v[v.length - 3], endZ = v[v.length - 1];
+    const currentAngle = Math.atan2(endX - startX, endZ - startZ);
+    const rotation = targetAngle - currentAngle;
+    const cos = Math.cos(rotation), sin = Math.sin(rotation);
+
+    // Rotate all Hips positions around the start point
+    for (let i = 0; i < v.length; i += 3) {
+        const dx = v[i] - startX;
+        const dz = v[i + 2] - startZ;
+        v[i] = startX + dx * cos - dz * sin;
+        v[i + 2] = startZ + dx * sin + dz * cos;
+    }
+    return { clip, skeleton: result.skeleton };
+}
+
+// Classify user chat intent via Gemini
+const CHAT_CLASSIFY_PROMPT = `You are a scene editing assistant. Classify the user's request into ONE action type and extract parameters. Output ONLY valid JSON (no markdown).
+
+ACTION TYPES:
+1. "add_motion" — user wants the character to do something (walk, run, dance, jump, etc.)
+   Output: {"action":"add_motion","prompt":"A person ...","duration":5,"target_object":null}
+   If they reference an object ("run towards the tree"), set target_object to that object name.
+
+2. "add_object" — user wants to add a prop/object to the scene
+   Output: {"action":"add_object","keyword":"search term","category":number,"size":"large"|"medium"|"small","direction":"left"|"right"|"front"|"behind"|"near <object>"|"random"}
+   CATEGORIES: 0=Food, 1=Clutter, 3=Transport, 4=Furniture, 5=Objects, 6=Nature, 7=Animals, 8=Buildings, 11=Other
+   If user says where to place it, use that direction. Otherwise "random".
+
+3. "modify_scene" — user wants to change lighting, ground color, time of day, weather
+   Output: {"action":"modify_scene","changes":{"ground_color":"#hex","ambient_intensity":number,"fog":bool}}
+
+Respond with ONLY the JSON object.`;
+
+async function classifyChat(userMsg) {
+    const res = await fetch(GEMINI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            contents: [{ parts: [{ text: CHAT_CLASSIFY_PROMPT + '\n\nUser says: ' + userMsg }] }],
+            generationConfig: { temperature: 0.2 }
+        })
+    });
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error('Empty classification response');
+    const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    return JSON.parse(clean);
+}
+
+// Resolve a direction string to [x, z] coordinates
+function resolveDirection(direction, scale = 400) {
+    const charPos = new THREE.Vector3();
+    if (currentBones) currentBones.getWorldPosition(charPos);
+    const cx = charPos.x, cz = charPos.z;
+
+    if (direction.startsWith('near ')) {
+        const target = findNearestObject(direction.replace('near ', ''));
+        if (target) {
+            // Place near the target with some offset
+            const offset = 80 + Math.random() * 60;
+            const angle = Math.random() * Math.PI * 2;
+            return [target.position.x + Math.cos(angle) * offset, target.position.z + Math.sin(angle) * offset];
+        }
+    }
+
+    const jitter = () => (Math.random() - 0.5) * 150;
+    const dist = 200 + Math.random() * scale;
+    switch (direction) {
+        case 'left':   return [cx - dist + jitter(), cz + jitter()];
+        case 'right':  return [cx + dist + jitter(), cz + jitter()];
+        case 'front':  return [cx + jitter(), cz + dist + jitter()];
+        case 'behind': return [cx + jitter(), cz - dist + jitter()];
+        default: {
+            const a = Math.random() * Math.PI * 2;
+            return [cx + Math.cos(a) * dist, cz + Math.sin(a) * dist];
+        }
+    }
+}
+
+// Handle add_object action
+async function handleAddObject(params) {
+    const [x, z] = resolveDirection(params.direction || 'random');
+    const position = [x, 0, z];
+    const sizeScales = { large: 250, medium: 100, small: 30 };
+    const targetScale = sizeScales[params.size] || 100;
+
+    log(`Adding "${params.keyword}" (${params.direction || 'random'})...`, 'scene', 'chat-action');
+
+    // Try procedural first
+    const procedural = tryProceduralModel(params.keyword, targetScale);
+    if (procedural) {
+        procedural.position.set(x, 0, z);
+        procedural.userData._keyword = params.keyword;
+        scene.add(procedural);
+        sceneObjects.push(procedural);
+        log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+        return;
+    }
+
+    // Fetch from Poly Pizza
+    const glbUrl = await fetchPolyModel(params.keyword, params.category || 11);
+    if (glbUrl) {
+        const loaded = await loadGLBModel(glbUrl, position, targetScale, Math.random() * Math.PI * 2);
+        if (loaded) loaded.userData._keyword = params.keyword;
+        log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+    } else {
+        log(`Could not find "${params.keyword}" model`, 'error', 'chat-action');
+    }
+}
+
+// Handle add_motion action (with optional target object for BVH rotation)
+async function handleAddMotion(params) {
+    const dur = params.duration || 5;
+    let targetAngle = null;
+
+    // If targeting an object, find it and compute angle
+    if (params.target_object) {
+        const target = findNearestObject(params.target_object);
+        if (target) {
+            const charPos = new THREE.Vector3();
+            if (currentBones) currentBones.getWorldPosition(charPos);
+            targetAngle = Math.atan2(
+                target.position.x - charPos.x,
+                target.position.z - charPos.z
+            );
+            log(`Targeting nearest "${params.target_object}" at [${Math.round(target.position.x)}, ${Math.round(target.position.z)}]`, 'path');
+        } else {
+            log(`No "${params.target_object}" found in scene, generating motion anyway`, 'system');
+        }
+    }
+
+    log(`Generating motion (${dur}s)...`, 'motion', 'chat-action');
+    setPill('pill-motion', true);
+
+    try {
+        const res = await fetch(`${API}/generate-motion`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: enhanceMotionPrompt(params.prompt), duration: dur })
+        });
+        if (!res.ok) throw new Error('Motion generation failed');
+        const bvh = await res.text();
+
+        let newClip;
+        if (targetAngle !== null) {
+            // Rotate the BVH root motion to face the target
+            const rotated = rotateBVHToward(bvh, targetAngle);
+            newClip = rotated.clip;
+        } else {
+            const loader = new BVHLoader();
+            newClip = loader.parse(bvh).clip;
+        }
+
+        const mergedClip = mergeClips(currentClip, newClip, 0.4);
+        mixer.stopAllAction();
+        mixer.uncacheRoot(currentBones);
+        mixer = new THREE.AnimationMixer(currentBones);
+        mixer.timeScale = 1.5;
+        currentClip = mergedClip;
+        currentAction = mixer.clipAction(mergedClip);
+        currentAction.play();
+
+        timelineClips.push({ prompt: params.prompt, duration: newClip.duration, clip: newClip });
+        totalDuration = mergedClip.duration;
+        renderTimelineClips();
+
+        const fullPath = extractPathFromClip(mergedClip);
+        updatePathVisualization(fullPath);
+        // Update terrain for the new extended path
+        if (groundMesh) applyTerrainFromPath(groundMesh, fullPath);
+
+        log(`Added motion: "${params.prompt}" (${newClip.duration.toFixed(1)}s)`, 'success', 'chat-action');
+    } catch (err) {
+        log(`Error: ${err.message}`, 'error', 'chat-action');
+    }
+    setPill('pill-motion', false);
+}
+
+// Handle modify_scene action
+function handleModifyScene(params) {
+    const changes = params.changes || {};
+    if (changes.ground_color && groundMesh) {
+        groundMesh.material.color.set(changes.ground_color);
+        log(`Ground color changed to ${changes.ground_color}`, 'scene');
+    }
+    if (changes.ambient_intensity !== undefined) {
+        scene.traverse(obj => {
+            if (obj.isAmbientLight) obj.intensity = changes.ambient_intensity;
+        });
+        log(`Ambient light set to ${changes.ambient_intensity}`, 'scene');
+    }
+    log('Scene updated', 'success');
+}
+
+// Main chat handler
+async function handleChat(userMsg) {
+    if (!userMsg.trim() || !currentClip) return;
+
+    chatInput.disabled = true;
+    chatInput.placeholder = 'Processing...';
+    log(`> ${userMsg}`, 'user');
+
+    try {
+        const intent = await classifyChat(userMsg);
+
+        switch (intent.action) {
+            case 'add_motion':
+                await handleAddMotion(intent);
+                break;
+            case 'add_object':
+                await handleAddObject(intent);
+                break;
+            case 'modify_scene':
+                handleModifyScene(intent);
+                break;
+            default:
+                log('Not sure what to do with that — try adding a motion, object, or scene change', 'system');
+        }
+    } catch (err) {
+        log(`Error: ${err.message}`, 'error');
+    }
+
+    chatInput.disabled = false;
+    chatInput.placeholder = 'Add motion, object, or action...';
+    chatInput.focus();
+}
+
+chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const msg = chatInput.value.trim();
+        chatInput.value = '';
+        handleChat(msg);
+    }
+});
+
+// Panel collapse/reopen
+document.getElementById('panel-collapse').addEventListener('click', () => {
+    document.getElementById('panel').classList.add('collapsed');
+    setTimeout(() => document.getElementById('panel-reopen').classList.add('visible'), 200);
+});
+document.getElementById('panel-reopen').addEventListener('click', () => {
+    document.getElementById('panel-reopen').classList.remove('visible');
+    document.getElementById('panel').classList.remove('collapsed');
+});
+
+// Reset view button — shows when camera deviates from default
+const defaultCamPos = new THREE.Vector3(0, 150, 400);
+const defaultTarget = new THREE.Vector3(0, 100, 0);
+const resetBtn = document.getElementById('reset-view');
+
+let _resetAnimating = false;
+resetBtn.addEventListener('click', () => {
+    // Smooth animated reset to character's current position
+    _resetAnimating = true;
+    const charPos = new THREE.Vector3();
+    if (currentBones) currentBones.getWorldPosition(charPos);
+    const targetTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
+    const targetCam = new THREE.Vector3(charPos.x, 250, charPos.z + 400);
+
+    let step = 0;
+    const duration = 30; // frames
+    const startCam = camera.position.clone();
+    const startTarget = controls.target.clone();
+    function animateReset() {
+        step++;
+        const t = step / duration;
+        const ease = t * t * (3 - 2 * t); // smoothstep
+        camera.position.lerpVectors(startCam, targetCam, ease);
+        controls.target.lerpVectors(startTarget, targetTarget, ease);
+        controls.update();
+        if (step < duration) requestAnimationFrame(animateReset);
+        else _resetAnimating = false;
+    }
+    animateReset();
+});
+
+// Check camera deviation every 500ms
+setInterval(() => {
+    if (_resetAnimating) return;
+    const charPos = new THREE.Vector3();
+    if (currentBones) currentBones.getWorldPosition(charPos);
+    const currentTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
+    const posDiff = controls.target.distanceTo(currentTarget);
+    if (posDiff > 200) {
+        resetBtn.classList.add('visible');
+    } else {
+        resetBtn.classList.remove('visible');
+    }
+}, 500);
+
+// ========== SCENE EDITOR ==========
+const edToolbar = document.getElementById('editor-toolbar');
+const edInfo = document.getElementById('editor-info');
+const modelPicker = document.getElementById('model-picker');
+let editorMode = null; // 'move' | 'rotate' | 'scale' | null
+let dragObject = null;
+let dragPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+let dragOffset = new THREE.Vector3();
+
+// Show editor toolbar after first generation
+function showEditor() { edToolbar.classList.add('visible'); }
+
+function enterBuildMode() {
+    document.querySelectorAll('.ed-build-only').forEach(b => b.style.display = 'flex');
+}
+function exitBuildMode() {
+    document.querySelectorAll('.ed-build-only').forEach(b => b.style.display = 'none');
+    setEditorMode(null);
+}
+
+function showEditorInfo(msg) {
+    edInfo.textContent = msg;
+    edInfo.classList.add('visible');
+    clearTimeout(edInfo._t);
+    edInfo._t = setTimeout(() => edInfo.classList.remove('visible'), 2000);
+}
+
+// === Panel tabs: Activity / Add ===
+const tabActivity = document.getElementById('tab-activity');
+const tabAdd = document.getElementById('tab-add');
+const consoleEl = document.getElementById('console');
+const chatBar = document.getElementById('chat-input-bar');
+const addContent = document.getElementById('add-tab-content');
+
+function switchTab(tab) {
+    if (tab === 'activity') {
+        tabActivity.classList.add('active'); tabAdd.classList.remove('active');
+        consoleEl.style.display = ''; chatBar.style.display = '';
+        addContent.classList.remove('visible');
+    } else {
+        tabAdd.classList.add('active'); tabActivity.classList.remove('active');
+        consoleEl.style.display = 'none'; chatBar.style.display = 'none';
+        addContent.classList.add('visible');
+    }
+}
+tabActivity.addEventListener('click', () => switchTab('activity'));
+tabAdd.addEventListener('click', () => switchTab('add'));
+
+// Custom model creation input (in Add tab)
+const addGrid = document.getElementById('add-tab-grid');
+const createInput = document.getElementById('add-create-input');
+const createStatus = document.getElementById('add-create-status');
+
+const GEMINI_IMG_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_KEY}`;
+const FAL_KEY = ''; // Set your fal.ai API key here (see .env)
+
+createInput.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter') return;
+    const keyword = createInput.value.trim();
+    if (!keyword) return;
+    createInput.disabled = true;
+    createStatus.style.display = 'block';
+    createStatus.textContent = 'Generating image...';
+
+    try {
+        // Step 1: Nanobanana image
+        const imgRes = await fetch(GEMINI_IMG_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: `A single ${keyword}, 3D render, three-quarter front view, bright even lighting, clean solid light gray background, low poly style, natural muted colors, no pure white, centered in frame` }] }],
+                generationConfig: { responseModalities: ['IMAGE', 'TEXT'] }
+            })
+        });
+        const imgData = await imgRes.json();
+        const imgPart = imgData.candidates[0].content.parts.find(p => p.inlineData);
+        if (!imgPart) throw new Error('No image generated');
+        const b64 = imgPart.inlineData.data;
+        const mime = imgPart.inlineData.mimeType || 'image/png';
+
+        createStatus.textContent = 'Building 3D mesh (~30s)...';
+
+        // Step 2: Trellis
+        const meshRes = await fetch('https://fal.run/fal-ai/trellis', {
+            method: 'POST',
+            headers: { 'Authorization': `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_url: `data:${mime};base64,${b64}` })
+        });
+        const meshData = await meshRes.json();
+        if (!meshData.model_mesh) throw new Error('3D conversion failed');
+        const glbUrl = meshData.model_mesh.url;
+
+        createStatus.textContent = 'Placing model...';
+
+        // Place it
+        const pos = [
+            (_charWorldPos.x || 0) + (Math.random() - 0.5) * 200,
+            0,
+            (_charWorldPos.z || 0) + (Math.random() - 0.5) * 200
+        ];
+        await loadGLBModel(glbUrl, pos, 100, 0);
+        log(`Created & placed "${keyword}"`, 'scene');
+
+        // Add to picker for future use
+        addModelToPicker(keyword.replace(/ /g, '_'), `data:image/png;base64,${b64.slice(0, 100)}`);
+
+        switchTab('activity');
+    } catch(err) {
+        createStatus.textContent = `Error: ${err.message}`;
+        setTimeout(() => { createStatus.style.display = 'none'; }, 3000);
+    }
+
+    createInput.disabled = false;
+    createInput.value = '';
+});
+
+// Populate model picker with thumbnails
+const AVAILABLE_MODELS = Object.keys(MODEL_MAP);
+
+const MODEL_ICONS = {
+    tree:'🌳',pine:'🌲',bush:'🌿',rock:'🪨',building:'🏢',house:'🏠',shop:'🏪',
+    car:'🚗',truck:'🚛',street_lamp:'💡',bench:'🪑',hydrant:'🧯',trash_can:'🗑️',
+    sofa:'🛋️',bookshelf:'📚',table:'🪑',lamp:'💡',chair:'🪑',statue:'🗿',
+    fountain:'⛲',barrel:'🪣',fence_post:'🚧',mailbox:'📬',stop_sign:'🛑',
+    traffic_cone:'🔶',dumpster:'🗑️',picnic_table:'🪑',swing_set:'🎠',slide:'🛝',
+    gazebo:'⛺',bridge:'🌉',boat:'⛵',motorcycle:'🏍️',bicycle:'🚲',castle:'🏰',
+    windmill:'🌀',tent:'⛺',campfire:'🔥',log:'🪵',grave_tombstone:'🪦',
+    pumpkin:'🎃',soccer_goal:'⚽',basketball_hoop:'🏀',punching_bag:'🥊',
+    treadmill:'🏋️',piano:'🎹',bed:'🛏️',bathtub:'🛁',toilet:'🚽',
+    refrigerator:'🧊',oven:'🍳',television:'📺',computer_desk:'🖥️',
+    office_chair:'💺',filing_cabinet:'🗄️',vending_machine:'🎰',phone_booth:'📞',
+    bus_stop_shelter:'🚏',water_tower:'🗼'
+};
+
+function addModelToPicker(name, thumbUrl) {
+    const div = document.createElement('div');
+    div.className = 'mp-item';
+
+    const img = document.createElement('img');
+    img.className = 'mp-thumb';
+    img.src = thumbUrl || `models/${name}.png`;
+    img.onerror = () => {
+        img.style.display = 'none';
+        // Show emoji icon as fallback
+        const icon = document.createElement('div');
+        icon.className = 'mp-icon';
+        icon.textContent = MODEL_ICONS[name] || '📦';
+        div.insertBefore(icon, label);
+    };
+
+    const label = document.createElement('span');
+    label.textContent = name.replace(/_/g, ' ');
+    div.appendChild(img);
+    div.appendChild(label);
+    div.addEventListener('click', () => {
+        enterPlaceMode(name);
+        switchTab('activity');
+    });
+    addGrid.appendChild(div);
+}
+
+AVAILABLE_MODELS.forEach(name => addModelToPicker(name));
+
+// Add button → switch to Add tab
+if (document.getElementById('ed-add')) document.getElementById('ed-add').addEventListener('click', () => {
+    switchTab('add');
+});
+
+// ========== PLACE MODE — model follows cursor until clicked ==========
+let placeMode = false;
+let placePreview = null;
+let placeName = null;
+const placeRaycaster = new THREE.Raycaster();
+const placeMouse = new THREE.Vector2();
+const placeGroundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const placeIntersect = new THREE.Vector3();
+
+async function enterPlaceMode(name) {
+    placeName = name;
+    log(`Click in scene to place "${name}"`, 'system');
+
+    // Try to load the GLB as a preview
+    try {
+        const url = `models/${name}.glb`;
+        const gltf = await new Promise((resolve, reject) => {
+            gltfLoader.load(url, resolve, undefined, reject);
+        });
+        placePreview = gltf.scene;
+        const box = new THREE.Box3().setFromObject(placePreview);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const s = 100 / (size.y || 1);
+        placePreview.scale.setScalar(s);
+        // Make it semi-transparent
+        placePreview.traverse(c => {
+            if (c.isMesh) {
+                c.material = c.material.clone();
+                c.material.transparent = true;
+                c.material.opacity = 0.5;
+            }
+        });
+        scene.add(placePreview);
+    } catch(e) {
+        // Use a simple box as placeholder
+        const geo = new THREE.BoxGeometry(40, 80, 40);
+        const mat = new THREE.MeshStandardMaterial({ color: 0x7c5cbf, transparent: true, opacity: 0.4 });
+        placePreview = new THREE.Mesh(geo, mat);
+        placePreview.position.y = 40;
+        const group = new THREE.Group();
+        group.add(placePreview);
+        placePreview = group;
+        scene.add(placePreview);
+    }
+
+    placeMode = true;
+    renderer.domElement.style.cursor = 'crosshair';
+}
+
+// Update preview position on mouse move
+renderer.domElement.addEventListener('mousemove', (e) => {
+    if (!placeMode || !placePreview) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    placeMouse.set(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    placeRaycaster.setFromCamera(placeMouse, camera);
+    if (placeRaycaster.ray.intersectPlane(placeGroundPlane, placeIntersect)) {
+        placePreview.position.x = placeIntersect.x;
+        placePreview.position.z = placeIntersect.z;
+    }
+});
+
+// Place on click
+renderer.domElement.addEventListener('click', async (e) => {
+    if (!placeMode || !placePreview) return;
+
+    const finalPos = [placePreview.position.x, 0, placePreview.position.z];
+
+    // Remove the transparent preview
+    scene.remove(placePreview);
+    placePreview = null;
+    placeMode = false;
+    renderer.domElement.style.cursor = '';
+
+    // Load the real model at this position
+    const url = `models/${placeName}.glb`;
+    log(`Placing "${placeName}"...`, 'scene');
+    try {
+        await loadGLBModel(url, finalPos, 100, 0);
+        log(`Placed "${placeName}"`, 'scene');
+    } catch(e) {
+        log(`Failed to place "${placeName}"`, 'error');
+    }
+});
+
+// Cancel with Escape
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && placeMode) {
+        if (placePreview) scene.remove(placePreview);
+        placePreview = null;
+        placeMode = false;
+        renderer.domElement.style.cursor = '';
+        log('Placement cancelled', 'system');
+    }
+});
+
+// Mode buttons
+function setEditorMode(mode) {
+    editorMode = editorMode === mode ? null : mode;
+    document.querySelectorAll('.ed-btn').forEach(b => b.classList.remove('active'));
+    if (editorMode) {
+        document.getElementById('ed-' + editorMode).classList.add('active');
+        showEditorInfo(editorMode === 'move' ? 'Click + drag to move' :
+            editorMode === 'rotate' ? 'Click object, drag to rotate' :
+            'Click object, drag to scale');
+    }
+}
+document.getElementById('ed-move').addEventListener('click', () => setEditorMode('move'));
+document.getElementById('ed-rotate').addEventListener('click', () => setEditorMode('rotate'));
+document.getElementById('ed-scale').addEventListener('click', () => setEditorMode('scale'));
+
+// Keyboard shortcuts for editor
+document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === 'm') setEditorMode('move');
+    if (e.key === 'r') setEditorMode('rotate');
+    if (e.key === 's' && !e.ctrlKey) setEditorMode('scale');
+    if (e.key === 'Escape') {
+        setEditorMode(null);
+        if (selectedObject) {
+            selectedObject.traverse(c => {
+                if (c.isMesh && c.userData._oe) c.material.emissive.copy(c.userData._oe);
+            });
+            selectedObject = null;
+            selectedType = null;
+            removeSelectionBox();
+        }
+        exitBuildMode();
+        modelPicker.classList.remove('visible');
+    }
+});
+
+// Drag handling for move/rotate/scale
+let _dragStartX = 0, _dragStartY = 0;
+let _dragStartRot = 0, _dragStartScale = 1;
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (!editorMode || !selectedObject || selectedType !== 'scene') return;
+    dragObject = selectedObject;
+    _dragStartX = e.clientX;
+    _dragStartY = e.clientY;
+    if (editorMode === 'rotate') _dragStartRot = dragObject.rotation.y;
+    if (editorMode === 'scale') _dragStartScale = dragObject.scale.x;
+
+    if (editorMode === 'move') {
+        // Calculate drag offset on ground plane
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouse = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        raycaster.setFromCamera(mouse, camera);
+        const hit = new THREE.Vector3();
+        raycaster.ray.intersectPlane(dragPlane, hit);
+        dragOffset.subVectors(dragObject.position, hit);
+        controls.enabled = false; // disable orbit while dragging
+    } else {
+        controls.enabled = false;
+    }
+});
+
+renderer.domElement.addEventListener('pointermove', (e) => {
+    if (!dragObject || !editorMode) return;
+
+    if (editorMode === 'move') {
+        const rect = renderer.domElement.getBoundingClientRect();
+        const mouse = new THREE.Vector2(
+            ((e.clientX - rect.left) / rect.width) * 2 - 1,
+            -((e.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        raycaster.setFromCamera(mouse, camera);
+        const hit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(dragPlane, hit)) {
+            dragObject.position.x = hit.x + dragOffset.x;
+            dragObject.position.z = hit.z + dragOffset.z;
+        }
+    } else if (editorMode === 'rotate') {
+        const dx = e.clientX - _dragStartX;
+        dragObject.rotation.y = _dragStartRot + dx * 0.01;
+    } else if (editorMode === 'scale') {
+        const dy = _dragStartY - e.clientY;
+        const s = Math.max(0.1, _dragStartScale * (1 + dy * 0.005));
+        dragObject.scale.setScalar(s);
+    }
+});
+
+renderer.domElement.addEventListener('pointerup', () => {
+    if (dragObject) {
+        dragObject = null;
+        controls.enabled = true;
+    }
+});
+
+// Show editor after first scene generation
+const _origGenerate = generate;
+
+// ========== LYRIA MUSIC ==========
+const LYRIA_URL = `https://generativelanguage.googleapis.com/v1beta/models/lyria-3-clip-preview:generateContent?key=${GEMINI_KEY}`;
+let musicAudio = null; // <audio> element for current soundtrack
+let musicMuted = false;
+let musicAudioCtx = null;
+let musicStreamDest = null;
+
+async function generateMusic(scenePrompt) {
+    setPill('pill-music', true);
+    log('Generating soundtrack...', 'music', 'music-status');
+
+    const musicPrompt = `Create a 30-second instrumental soundtrack for this scene: "${scenePrompt}".
+Make it atmospheric and cinematic. No vocals, no lyrics. Match the mood and energy of the scene.
+If the scene is dark or spooky, use minor keys and tension. If it's happy or active, use upbeat tempo.
+Keep it subtle enough to be background music for a 3D animation.`;
+
+    try {
+        const res = await fetch(LYRIA_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: musicPrompt }] }],
+                generationConfig: { responseModalities: ['AUDIO'] }
+            })
+        });
+
+        const data = await res.json();
+        const parts = data?.candidates?.[0]?.content?.parts;
+        if (!parts) throw new Error('No audio in response');
+
+        const audioPart = parts.find(p => p.inlineData);
+        if (!audioPart) throw new Error('No audio data returned');
+
+        const b64 = audioPart.inlineData.data;
+        const mime = audioPart.inlineData.mimeType || 'audio/mp3';
+
+        // Create audio element from base64
+        if (musicAudio) { musicAudio.pause(); musicAudio.remove(); }
+        musicAudioCtx = null;
+        musicStreamDest = null;
+        musicAudio = document.createElement('audio');
+        musicAudio.src = `data:${mime};base64,${b64}`;
+        musicAudio.loop = true;
+        musicAudio.volume = 0.35;
+        musicAudio.muted = musicMuted;
+
+        // Set up persistent audio capture route
+        try {
+            musicAudioCtx = new AudioContext();
+            const source = musicAudioCtx.createMediaElementSource(musicAudio);
+            musicStreamDest = musicAudioCtx.createMediaStreamDestination();
+            source.connect(musicStreamDest);
+            source.connect(musicAudioCtx.destination); // still plays through speakers
+        } catch (e) { /* fallback: no capture */ }
+
+        // Fade in
+        musicAudio.volume = 0;
+        musicAudio.play().catch(() => {}); // may need user interaction
+        let fadeIn = setInterval(() => {
+            if (musicAudio.volume < 0.35) {
+                musicAudio.volume = Math.min(0.35, musicAudio.volume + 0.02);
+            } else {
+                clearInterval(fadeIn);
+            }
+        }, 100);
+
+        log('Soundtrack playing', 'music', 'music-status');
+    } catch (err) {
+        log(`Music: ${err.message}`, 'error', 'music-status');
+    }
+    setPill('pill-music', false);
+}
+
+// Music toggle removed — music only used during video render
+
+// Get audio stream for mixing into video recording
+function getMusicStream() {
+    if (!musicStreamDest) return null;
+    return musicStreamDest.stream;
+}
+
+// ========== RENDER VIDEO (Orbit Capture) ==========
+const renderOverlay = document.getElementById('render-overlay');
+const renderDot = document.getElementById('render-dot');
+const renderHint = document.getElementById('render-hint');
+const renderProgress = document.getElementById('render-progress');
+const renderFill = document.getElementById('render-fill');
+const renderBtn = document.getElementById('render-btn');
+let renderMode = false;
+
+renderBtn.addEventListener('click', async () => {
+    if (isRecording) return;
+    if (!currentClip) { log('Nothing to render yet', 'system'); return; }
+
+    // Find orbit center — use character position
+    const orbitCenter = new THREE.Vector3();
+    if (currentBones) currentBones.getWorldPosition(orbitCenter);
+    orbitCenter.y = 0;
+
+    // Save original camera state
+    const origPos = camera.position.clone();
+    const origTarget = controls.target.clone();
+    controls.enabled = false;
+
+    // Zoom out to a high angle first
+    const ORBIT_RADIUS = 700;
+    const ORBIT_HEIGHT = 550;
+    const startAngle = Math.atan2(
+        camera.position.x - orbitCenter.x,
+        camera.position.z - orbitCenter.z
+    );
+
+    // Smooth transition to zoomed-out view
+    const zoomTarget = new THREE.Vector3(
+        orbitCenter.x + Math.sin(startAngle) * ORBIT_RADIUS,
+        ORBIT_HEIGHT,
+        orbitCenter.z + Math.cos(startAngle) * ORBIT_RADIUS
+    );
+    const ZOOM_DURATION = 800;
+    const zoomStart = Date.now();
+    const zoomFrom = camera.position.clone();
+    await new Promise(resolve => {
+        function zoomStep() {
+            const t = Math.min((Date.now() - zoomStart) / ZOOM_DURATION, 1);
+            const e = t * t * (3 - 2 * t); // smoothstep
+            camera.position.lerpVectors(zoomFrom, zoomTarget, e);
+            camera.lookAt(orbitCenter.x, 40, orbitCenter.z);
+            renderer.render(scene, camera);
+            if (t < 1) requestAnimationFrame(zoomStep);
+            else resolve();
+        }
+        requestAnimationFrame(zoomStep);
+    });
+
+    // Generate music if not already available
+    if (!musicAudio || musicAudio.paused) {
+        const scenePrompt = timelineClips.map(c => c.prompt).join('. ') || 'ambient scene';
+        renderFill.style.width = '0%';
+        renderProgress.style.display = 'block';
+        log('Generating soundtrack...', 'music', 'render-status');
+        await generateMusic(scenePrompt);
+    }
+
+    // Restart music from beginning for clean recording
+    if (musicAudio) {
+        musicAudio.currentTime = 0;
+        musicAudio.muted = false;
+        musicAudio.volume = 0.35;
+        await musicAudio.play().catch(() => {});
+        // Resume AudioContext if suspended (autoplay policy)
+        if (musicAudioCtx && musicAudioCtx.state === 'suspended') {
+            await musicAudioCtx.resume();
+        }
+    }
+
+    // Show progress bar
+    renderProgress.style.display = 'block';
+    renderFill.style.width = '0%';
+
+    // Setup MediaRecorder
+    const canvas = renderer.domElement;
+    const videoStream = canvas.captureStream(30);
+    const stream = new MediaStream([...videoStream.getTracks()]);
+    if (musicStreamDest) {
+        musicStreamDest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+    }
+
+    const chunks = [];
+    const recorder = new MediaRecorder(stream, {
+        mimeType: 'video/webm;codecs=vp9',
+        videoBitsPerSecond: 8000000
+    });
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'kinetik-render.webm';
+        a.click();
+        URL.revokeObjectURL(url);
+        log('Video saved', 'success');
+    };
+
+    // Orbit parameters
+    const DURATION = 6000;
+    const ROTATION_AMOUNT = Math.PI * 1.5;
+    let lastFrameTime = performance.now();
+
+    const startTime = Date.now();
+    isRecording = true;
+    recorder.start();
+    log('Recording orbit...', 'render', 'render-status');
+
+    function orbitFrame(now) {
+        const rawDt = (now - lastFrameTime) / 1000;
+        const dt = Math.min(rawDt, 0.05);
+        lastFrameTime = now;
+        const elapsed = Date.now() - startTime;
+        const t = Math.min(elapsed / DURATION, 1);
+        renderFill.style.width = (t * 100) + '%';
+
+        const eased = t < 0.5
+            ? 2 * t * t
+            : 1 - Math.pow(-2 * t + 2, 2) / 2;
+        const angle = startAngle + eased * ROTATION_AMOUNT;
+        camera.position.set(
+            orbitCenter.x + Math.sin(angle) * ORBIT_RADIUS,
+            ORBIT_HEIGHT,
+            orbitCenter.z + Math.cos(angle) * ORBIT_RADIUS
+        );
+        camera.lookAt(orbitCenter.x, 40, orbitCenter.z);
+
+        if (mixer) mixer.update(dt);
+        if (!skinnedCharMesh) updateBodyMeshes();
+        renderer.render(scene, camera);
+
+        if (t < 1) {
+            requestAnimationFrame(orbitFrame);
+        } else {
+            isRecording = false;
+            recorder.stop();
+            camera.position.copy(origPos);
+            controls.target.copy(origTarget);
+            controls.enabled = true;
+            controls.update();
+
+            // Stop music after render
+            if (musicAudio) { musicAudio.pause(); musicAudio.currentTime = 0; }
+
+            renderProgress.style.display = 'none';
+            log('Render complete', 'success', 'render-status');
+        }
+    }
+    requestAnimationFrame(orbitFrame);
+});
+
+// Render mode no longer uses overlay click — renders directly on button press
+
+// ========== .KINETIK EXPORT / IMPORT ==========
+
+// Export removed
+
+// Import .kinetik file
+async function handleImportFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = ''; // reset for re-import
+
+    try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+
+        if (data.format !== 'kinetik') {
+            log('Invalid .kinetik file', 'error');
+            return;
+        }
+
+        log(`Importing "${file.name}"...`, 'system');
+
+        // Dismiss welcome if visible
+        document.getElementById('welcome').classList.add('hidden');
+        document.getElementById('panel').classList.remove('collapsed');
+
+        // Rebuild scene from saved data
+        const config = {
+            scene: {
+                type: 'outdoor',
+                models: data.scene.models.map(m => ({
+                    keyword: m.keyword,
+                    category: 6,
+                    size: 'medium'
+                })),
+                ground: { color: data.scene.ground_color },
+                lights: data.scene.lights || []
+            },
+            _characterPath: [[0, 0]]
+        };
+
+        // Build scene first
+        await buildScene(config);
+
+        // Now reposition models to their saved positions
+        let modelIdx = 0;
+        for (const obj of sceneObjects) {
+            if (obj.userData._isGround) continue;
+            if (obj.isLight) continue;
+            if (modelIdx < data.scene.models.length) {
+                const saved = data.scene.models[modelIdx];
+                obj.position.set(saved.position[0], saved.position[1], saved.position[2]);
+                obj.rotation.y = saved.rotation || 0;
+                obj.scale.setScalar(saved.scale || 1);
+                modelIdx++;
+            }
+        }
+
+        // Load BVH animation
+        if (data.bvh) {
+            await loadBVH(data.bvh);
+            lastBvhText = data.bvh;
+
+            // Rebuild timeline
+            timelineClips = data.timeline.map(t => ({
+                prompt: t.prompt,
+                duration: t.duration,
+                clip: currentClip
+            }));
+            totalDuration = currentClip.duration;
+            renderTimelineClips();
+            showTimeline();
+            document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+            isPlaying = true;
+        }
+
+        // Restore camera
+        if (data.camera) {
+            camera.position.set(...data.camera.position);
+            controls.target.set(...data.camera.target);
+            controls.update();
+        }
+
+        log(`Imported "${file.name}" successfully`, 'success');
+
+    } catch (err) {
+        log(`Import error: ${err.message}`, 'error');
+    }
+}
+document.getElementById('import-file').addEventListener('change', handleImportFile);
+
+// ========== VIDEO ORBIT RECORDING ==========
+let recordMode = false, orbitMarker = null;
+if (document.getElementById('ed-record')) document.getElementById('ed-record').addEventListener('click', () => {
+    if (recordMode) { recordMode = false; if (orbitMarker) { scene.remove(orbitMarker); orbitMarker = null; } renderer.domElement.style.cursor = 'default'; document.getElementById('ed-record').classList.remove('active'); return; }
+    recordMode = true; renderer.domElement.style.cursor = 'crosshair'; document.getElementById('ed-record').classList.add('active');
+    showEditorInfo('Click where the camera should orbit');
+    orbitMarker = new THREE.Mesh(new THREE.SphereGeometry(6,16,12), new THREE.MeshStandardMaterial({color:0x22c55e,emissive:0x16a34a,emissiveIntensity:0.5}));
+    orbitMarker.position.y = 3; scene.add(orbitMarker);
+});
+renderer.domElement.addEventListener('mousemove', (ev) => {
+    if (!recordMode || !orbitMarker) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const m2 = new THREE.Vector2(((ev.clientX-rect.left)/rect.width)*2-1,-((ev.clientY-rect.top)/rect.height)*2+1);
+    raycaster.setFromCamera(m2, camera);
+    const hp = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0),0), hp)) orbitMarker.position.set(hp.x,3,hp.z);
+});
+renderer.domElement.addEventListener('click', async (ev2) => {
+    if (!recordMode || !orbitMarker) return;
+    const ctr = orbitMarker.position.clone(); ctr.y = 100;
+    recordMode = false; scene.remove(orbitMarker); orbitMarker = null;
+    renderer.domElement.style.cursor = 'default'; document.getElementById('ed-record').classList.remove('active');
+    const dur = Math.max(5, totalDuration/1.5), fps = 30, nF = Math.round(dur*fps);
+    document.getElementById('rec-badge').classList.add('visible'); controls.enabled = false;
+    const strm = renderer.domElement.captureStream(fps);
+    const mt = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+    const mrec = new MediaRecorder(strm, {mimeType:mt, videoBitsPerSecond:8000000});
+    const chnks = []; mrec.ondataavailable = e3 => { if (e3.data.size>0) chnks.push(e3.data); };
+    isRecording = true;
+    mrec.start(); if (mixer) mixer.setTime(0);
+    const savC = camera.position.clone(), savT = controls.target.clone();
+    for (let f = 0; f < nF; f++) {
+        const ang = (f/nF)*Math.PI*2;
+        camera.position.set(ctr.x+Math.cos(ang)*500, ctr.y+250, ctr.z+Math.sin(ang)*500);
+        camera.lookAt(ctr);
+        if (mixer) mixer.update(1/fps);
+        if (!skinnedCharMesh) updateBodyMeshes();
+        renderer.render(scene, camera);
+        await new Promise(r => requestAnimationFrame(r));
+    }
+    isRecording = false;
+    mrec.stop(); document.getElementById('rec-badge').classList.remove('visible');
+    camera.position.copy(savC); controls.target.copy(savT); controls.enabled = true; controls.update();
+    mrec.onstop = () => {
+        const bl = new Blob(chnks,{type:'video/webm'}); const u = URL.createObjectURL(bl);
+        const dl = document.createElement('a'); dl.href = u; dl.download = 'kinetik_scene.webm'; dl.click();
+        URL.revokeObjectURL(u); log('Video exported!','success');
+    };
+});
+
+// ========== .KINETIK SAVE ==========
+if (document.getElementById('ed-save')) document.getElementById('ed-save').addEventListener('click', () => {
+    const d = {
+        version:'1.0', name:'My Scene', created:new Date().toISOString(),
+        timeline: timelineClips.map(c => ({prompt:c.prompt,duration:c.duration})),
+        totalDuration: totalDuration,
+        objects: sceneObjects.filter(o => !o.userData._isGround).map(o => ({
+            pos:[Math.round(o.position.x),Math.round(o.position.y),Math.round(o.position.z)],
+            rot:+(o.rotation.y).toFixed(2), scale:+(o.scale.x).toFixed(2)
+        })),
+        camera:{pos:[Math.round(camera.position.x),Math.round(camera.position.y),Math.round(camera.position.z)],
+            target:[Math.round(controls.target.x),Math.round(controls.target.y),Math.round(controls.target.z)]},
+        activity: Array.from(document.querySelectorAll('.log-msg')).slice(-50).map(el => el.textContent)
+    };
+    const bl = new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
+    const aa = document.createElement('a'); aa.href = URL.createObjectURL(bl);
+    aa.download = 'my_scene.kinetik'; aa.click(); URL.revokeObjectURL(aa.href);
+    log('Saved my_scene.kinetik','success');
+});
+
