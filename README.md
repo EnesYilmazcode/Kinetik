@@ -10,11 +10,42 @@ Built at GLITCH x Google DeepMind @ UCLA.
 
 ## How it works
 
-1. Type something like _"A person sneaks through a dark warehouse"_
-2. **Kimodo** (NVIDIA, on RunPod GPU) generates skeleton animation from the prompt
-3. **Gemini** picks scene objects, the layout engine places them around the character path
-4. **Nanobanana + Trellis** provide 73 pre-generated 3D models (trees, buildings, cars, furniture...)
-5. **Three.js** renders everything in the browser with a video-editor-style timeline
+```
+                        "A person sneaks through a dark warehouse"
+                                          |
+                                          v
+                                 +------------------+
+                                 |    Gemini 2.5    |
+                                 |   (Orchestrator) |
+                                 +------------------+
+                                    |            |
+                          scene JSON|            |motion prompt
+                                    v            v
+                        +--------------+   +--------------+
+                        | Scene Engine |   |   Kimodo     |
+                        | objects,     |   |   (NVIDIA)   |
+                        | lights, fog  |   |  text -> BVH |
+                        +--------------+   +--------------+
+                                    |            |
+            +------------+          |            |
+            | Nanobanana |--img->+--------+      |
+            | (Gemini)   |       |Trellis |      |
+            +------------+       |(fal.ai)|      |
+                                 +--------+      |
+                                  .glb  |        |
+                                    |   |        |
+                                    v   v        v
+                              +------------------------+
+                              |       Three.js         |
+                              |  3D scene + animated   |
+                              |  character in browser  |
+                              +------------------------+
+```
+
+1. **Gemini** decomposes the user's prompt into a scene layout (JSON) and a motion prompt
+2. **Kimodo** (NVIDIA, on RunPod GPU) turns the motion prompt into skeleton animation (BVH)
+3. **Nanobanana + Trellis** generate 3D models — Gemini creates a 2D render, fal.ai converts it to a .glb mesh
+4. **Three.js** renders everything together in the browser with a timeline editor
 
 <p align="center">
   <img src="assets/media/demo1.png" alt="Generated scene" width="500">
