@@ -486,7 +486,6 @@ radial-gradient(ellipse 600px 400px at 80% 30%, rgba(124,92,191,0.04) 0%, transp
     box-shadow: 0 0 12px rgba(34,197,94,0.5); pointer-events: none;
     transform: translate(-50%, -50%); display: none;
 }
-#render-overlay.active #render-dot { display: none; }
 #render-hint {
     position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
     padding: 8px 18px; border-radius: 20px; background: rgba(0,0,0,0.75);
