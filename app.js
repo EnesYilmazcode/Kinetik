@@ -5,6 +5,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const API = 'https://c8sh4j1k8nkzp9-8000.proxy.runpod.net';
 const GEMINI_KEY = ''; // Set your Gemini API key here (see .env)
+if (!GEMINI_KEY) console.warn('GEMINI_KEY not set — scene generation will not work (see .env)');
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
 const viewport = document.getElementById('viewport');
 
