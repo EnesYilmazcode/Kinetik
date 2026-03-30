@@ -331,7 +331,6 @@ radial-gradient(ellipse 600px 400px at 80% 30%, rgba(124,92,191,0.04) 0%, transp
 }
 .w-ex:active { opacity: 0.8; }
 .w-ex:hover .w-ex-label { color: var(--accent); }
-.w-ex-icon { display: none; }
 .w-ex-label {
     font-size: 15px; color: var(--text-2); font-weight: 500;
     font-family: 'DM Sans', sans-serif;
