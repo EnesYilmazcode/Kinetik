@@ -65,6 +65,10 @@ Built at GLITCH x Google DeepMind @ UCLA.
 - **Camera follow** — ground tracks character, Reset View button smoothly returns camera
 - **Prompt enhancement** — silently rewrites prompts for better Kimodo results
 
+<p align="center">
+  <img src="assets/media/renderdemo.gif" alt="Render demo" width="600">
+</p>
+
 ## Stack
 
 | What | How |
