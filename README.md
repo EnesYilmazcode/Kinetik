@@ -149,4 +149,4 @@ docs/                     — project docs and research notes
 
 ## Team
 
-Built by Enes Yilmaz ([@enesy](https://github.com/enesy)) — CS & Engineering, Ohio State University
+Built by [@EnesYilmazCode](https://github.com/EnesYilmazCode)
