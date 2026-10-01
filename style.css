@@ -57,8 +57,8 @@ body.rendering #timeline-bar, body.rendering #reset-view, body.rendering #topbar
 }
 .tb-right { display: flex; align-items: center; gap: 8px; }
 #topbar h1 {
-    font-family: var(--mono); font-size: 15px; font-weight: 500;
-    color: var(--accent); letter-spacing: 3px; cursor: pointer; user-select: none;
+    font-family: var(--mono); font-size: 13px; font-weight: 500; text-transform: uppercase;
+    color: var(--accent); letter-spacing: 4px; cursor: pointer; user-select: none;
 }
 .gpu-pill {
     display: flex; align-items: center; gap: 7px;

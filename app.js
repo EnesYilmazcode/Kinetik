@@ -2325,9 +2325,15 @@ document.querySelectorAll('.w-ex').forEach(card => {
 
 const welcomeInputEl = document.getElementById('welcome-input');
 const welcomeArrow = document.querySelector('.w-input-arrow');
-if (welcomeArrow) welcomeInputEl.addEventListener('input', () => {
-    welcomeArrow.classList.toggle('visible', welcomeInputEl.value.trim().length > 0);
-});
+if (welcomeArrow) {
+    welcomeInputEl.addEventListener('input', () => {
+        welcomeArrow.classList.toggle('visible', welcomeInputEl.value.trim().length > 0);
+    });
+    welcomeArrow.addEventListener('click', () => {
+        const v = welcomeInputEl.value.trim();
+        if (v) dismissWelcome(v);
+    });
+}
 welcomeInputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
         const v = e.target.value.trim();
@@ -2553,8 +2559,11 @@ function animate() {
         selectionBox.material.opacity = pulse;
     }
     updateEnvironmentFollow();
+    if (welcomeOpen()) return; // fully covered; save the GPU for the preview
     renderer.render(scene, camera);
 }
+const _welcomeEl = document.getElementById('welcome');
+function welcomeOpen() { return !_welcomeEl.classList.contains('hidden'); }
 
 // Sun, shadow frustum, sky and contact shadow track the character.
 const _envFocus = new THREE.Vector3();
@@ -2611,35 +2620,71 @@ let welcomeInterval = null;
     const container = document.getElementById('w-preview');
     if (!container) return;
 
-    // Separate scene, camera, renderer for the preview box
+    // Separate scene, camera, renderer for the preview box.
+    // Transparent canvas: the card's CSS gradient is the backdrop.
     const wScene = new THREE.Scene();
-    wScene.background = new THREE.Color(0xe8e4f0);
 
-    const wCamera = new THREE.PerspectiveCamera(50, 480 / 520, 1, 2000);
-    wCamera.position.set(0, 120, 300);
-    wCamera.lookAt(0, 80, 0);
+    const wCamera = new THREE.PerspectiveCamera(42, 460 / 520, 1, 2000);
+    wCamera.position.set(0, 125, 330);
+    wCamera.lookAt(0, 82, 0);
 
     const wRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    wRenderer.setSize(480, 520);
-    wRenderer.setPixelRatio(window.devicePixelRatio);
+    wRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    wRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    wRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    wRenderer.toneMappingExposure = 1.05;
+    wRenderer.shadowMap.enabled = true;
+    wRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(wRenderer.domElement);
 
-    // Lights
-    wScene.add(new THREE.AmbientLight(0x606080, 2));
-    const wKey = new THREE.DirectionalLight(0xffffff, 2);
-    wKey.position.set(100, 200, 150);
-    wScene.add(wKey);
-    const wFill = new THREE.DirectionalLight(0x8888ff, 0.6);
-    wFill.position.set(-100, 100, -50);
-    wScene.add(wFill);
+    // Fit the canvas to the card (it changes size on phones).
+    function wResize() {
+        const w = container.clientWidth || 460, hgt = container.clientHeight || 520;
+        wRenderer.setSize(w, hgt, false);
+        wCamera.aspect = w / hgt;
+        // Narrow cards pull the camera back so a backflip still fits.
+        wCamera.position.z = 330 * Math.max(1, 0.9 / wCamera.aspect);
+        wCamera.updateProjectionMatrix();
+    }
+    wResize();
+    if (window.ResizeObserver) new ResizeObserver(wResize).observe(container);
 
-    // Simple floor disc
-    const floorGeo = new THREE.CircleGeometry(150, 32);
-    const floorMat = new THREE.MeshStandardMaterial({ color: 0xd4d0dc, roughness: 0.9 });
-    const floor = new THREE.Mesh(floorGeo, floorMat);
+    // Lights: soft sky light plus a warm key that casts the floor shadow
+    wScene.add(new THREE.HemisphereLight(0xf6f3fb, 0x9a90a8, 1.9));
+    const wKey = new THREE.DirectionalLight(0xfff3e6, 2.6);
+    wKey.position.set(120, 280, 180);
+    wKey.castShadow = true;
+    wKey.shadow.mapSize.set(1024, 1024);
+    Object.assign(wKey.shadow.camera, { left: -160, right: 160, top: 160, bottom: -160, near: 50, far: 700 });
+    wKey.shadow.normalBias = 0.6;
+    wScene.add(wKey);
+    const wRim = new THREE.DirectionalLight(0xc9b8f0, 0.9);
+    wRim.position.set(-160, 140, -200);
+    wScene.add(wRim);
+
+    // Floor: a soft lavender pool plus a shadow-only plane, no hard disc edge
+    const poolCanvas = document.createElement('canvas');
+    poolCanvas.width = poolCanvas.height = 256;
+    const pg = poolCanvas.getContext('2d');
+    const grad = pg.createRadialGradient(128, 128, 0, 128, 128, 128);
+    grad.addColorStop(0, 'rgba(124,92,191,0.16)');
+    grad.addColorStop(0.6, 'rgba(124,92,191,0.06)');
+    grad.addColorStop(1, 'rgba(124,92,191,0)');
+    pg.fillStyle = grad;
+    pg.fillRect(0, 0, 256, 256);
+    const poolTex = new THREE.CanvasTexture(poolCanvas);
+    poolTex.colorSpace = THREE.SRGBColorSpace;
+    const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(420, 420),
+        new THREE.MeshBasicMaterial({ map: poolTex, transparent: true, depthWrite: false, toneMapped: false })
+    );
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = 0;
     wScene.add(floor);
+    const shadowFloor = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.ShadowMaterial({ opacity: 0.16 }));
+    shadowFloor.rotation.x = -Math.PI / 2;
+    shadowFloor.position.y = 0.2;
+    shadowFloor.receiveShadow = true;
+    wScene.add(shadowFloor);
 
     // State
     let wMixer = null;
@@ -2792,21 +2837,25 @@ let welcomeInterval = null;
         }
     }
 
-    // Render loop for preview
-    let wAnimId = null;
+    // Render loop for preview; it idles while the welcome screen is hidden
+    // so the logo can bring it back.
+    const welcomeEl = document.getElementById('welcome');
     function wAnimate() {
-        wAnimId = requestAnimationFrame(wAnimate);
-        if (wMixer) wMixer.update(wClock.getDelta());
+        requestAnimationFrame(wAnimate);
+        const dt = wClock.getDelta();
+        if (welcomeEl.classList.contains('hidden')) return;
+        if (wMixer) wMixer.update(dt);
         wUpdateBodyMeshes();
         wRenderer.render(wScene, wCamera);
     }
     wAnimate();
 
+    const castAll = () => wBodyMeshes.forEach(m => { m.castShadow = true; });
+
     // Schedule next motion when current clip ends
     async function playNextWelcomeMotion() {
-        if (document.getElementById('welcome').classList.contains('hidden')) {
-            if (wAnimId) cancelAnimationFrame(wAnimId);
-            wRenderer.dispose();
+        if (welcomeEl.classList.contains('hidden')) {
+            setTimeout(playNextWelcomeMotion, 1000);
             return;
         }
         welcomeMotionIdx = (welcomeMotionIdx + 1) % WELCOME_MOTIONS.length;
@@ -2815,6 +2864,7 @@ let welcomeInterval = null;
             const r = await fetch(m.file);
             if (r.ok) {
                 const dur = await wLoadBVH(await r.text());
+                castAll();
                 // Mirror on X if flagged
                 if (wGroup) wGroup.scale.x = m.mirror ? -1 : 1;
                 const label = document.getElementById('w-motion-label');
@@ -2834,6 +2884,7 @@ let welcomeInterval = null;
             if (text) {
                 try {
                     const dur = await wLoadBVH(text);
+                    castAll();
                     setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
                 } catch(e) { console.error('Welcome BVH parse error:', e); }
             }
