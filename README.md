@@ -43,7 +43,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 ```
 
 1. **Gemini** decomposes the user's prompt into a scene layout (JSON) and a motion prompt
-2. **Kimodo** (NVIDIA, on RunPod GPU) turns the motion prompt into skeleton animation (BVH)
+2. **Kimodo** (NVIDIA, served on Modal) turns the motion prompt into skeleton animation (BVH)
 3. **Nanobanana + Trellis** generate 3D models — Gemini creates a 2D render, fal.ai converts it to a .glb mesh
 4. **Three.js** renders everything together in the browser with a timeline editor
 
@@ -73,26 +73,41 @@ Built at GLITCH x Google DeepMind @ UCLA.
 
 | What | How |
 |------|-----|
-| Motion generation | NVIDIA Kimodo on RunPod (text → BVH skeletal animation) |
+| Motion generation | NVIDIA Kimodo (text → BVH skeletal animation) |
 | Scene planning | Gemini 2.5 Flash (prompt → structured JSON) |
 | 3D rendering | Three.js + GLTFLoader + BVHLoader + AnimationMixer |
 | 3D asset generation | Nanobanana (Gemini image gen) + Trellis v1 (fal.ai, image → GLB) |
-| Backend | FastAPI on RunPod (RTX 5000 Ada) |
+| Backend | FastAPI on Modal (serverless L4 GPU, scales to zero) |
 | Frontend | Vanilla JS, single index.html |
 
 ## Running locally
 
-```bash
-# Start the RunPod pod (needs GPU with Kimodo installed)
-# Then on the pod:
-cd /workspace && uvicorn scripts.server_fast:app --host 0.0.0.0 --port 8000
+The motion model runs on [Modal](https://modal.com). Kimodo's text encoder is
+Llama 3 8B, so your Hugging Face account needs access to
+[meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct).
 
-# Locally, serve the frontend:
+```bash
+pip install modal
+modal setup
+modal secret create kinetik-hf HF_TOKEN=<your token>
+
+# One-off test: builds the image, caches the weights in a volume, writes a BVH
+modal run scripts/modal_app.py --prompt "a person waves hello"
+
+# Deploy the web endpoint
+modal deploy scripts/modal_app.py
+```
+
+Point the frontend at your deployment with `?api=https://<you>--kinetik-kimodo-web.modal.run`,
+or change the `API` default at the top of `app.js`. Then serve it:
+
+```bash
 python -m http.server 8080
 # Open http://localhost:8080
 ```
 
-Set the RunPod API URL in `index.html` — look for the `API` variable near the top.
+The GPU container shuts down after 5 idle minutes, so you pay nothing while nobody is
+generating. Generated motions are cached in the volume by prompt.
 
 ## Generating 3D models
 
@@ -134,9 +149,8 @@ assets/
   character/              — SOMA character mesh + skeleton data
   media/                  — README images and demo gif
 scripts/
-  server_fast.py          — FastAPI backend for Kimodo on RunPod
+  modal_app.py            — Kimodo motion server on Modal
   generate_models.py      — batch model generation script
-  main.py                 — CLI motion generation test
 docs/                     — project docs and research notes
 ```
 
