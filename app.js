@@ -17,7 +17,7 @@ const scene = new THREE.Scene();
 const IS_SMALL = Math.min(window.innerWidth, window.innerHeight) < 600;
 
 const camera = new THREE.PerspectiveCamera(50, viewport.clientWidth / viewport.clientHeight, 5, 12000);
-camera.position.set(0, 150, 400);
+camera.position.set(380, 300, 560);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
@@ -30,7 +30,10 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 viewport.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 100, 0);
+controls.target.set(0, 30, 0);
+// The empty stage turns slowly until there is a scene to look at.
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.35;
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 90;
@@ -579,6 +582,13 @@ RULES:
 - motion_prompt MUST start with "A person" and describe expressive, continuous motion
 - 2-3 lights, always include ambient (0.8-1.5). No fog.`;
 
+// A readable reason for a Gemini call that came back without text.
+function geminiProblem(res, data) {
+    if (!GEMINI_KEY) return 'No Gemini API key set (GEMINI_KEY in app.js)';
+    if (data?.error?.message) return `Gemini: ${data.error.message}`;
+    return `Gemini returned no text (HTTP ${res.status})`;
+}
+
 async function callGemini(userPrompt, characterPath = null) {
     let fullPrompt = SCENE_SYSTEM_PROMPT + '\n\nUser prompt: ' + userPrompt;
     if (characterPath && characterPath.length > 0) {
@@ -594,9 +604,9 @@ async function callGemini(userPrompt, characterPath = null) {
             generationConfig: { temperature: 0.7 }
         })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Gemini returned empty response');
+    if (!text) throw new Error(geminiProblem(res, data));
     // Strip markdown code fences if present
     const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     return JSON.parse(clean);
@@ -870,7 +880,7 @@ function togglePath() {
     if (pathLine) pathLine.visible = pathVisible;
     const btn = document.getElementById('path-toggle');
     btn.classList.toggle('active', pathVisible);
-    btn.textContent = pathVisible ? 'Hide Path' : 'Show Path';
+    btn.textContent = pathVisible ? 'Hide path' : 'Show path';
 }
 document.getElementById('path-toggle').addEventListener('click', togglePath);
 
@@ -1797,7 +1807,7 @@ async function buildScene(config) {
     let phIdx = 0;
     const mainModels = placedModels.filter(m => !m._isFill);
     const fillModels = placedModels.filter(m => m._isFill);
-    let loadedCount = 0;
+    let loadedCount = 0, missingCount = 0;
     const totalMain = mainModels.length;
 
     log(`Placing models... (0/${totalMain})`, 'scene', 'model-progress');
@@ -1816,6 +1826,7 @@ async function buildScene(config) {
             if (!isFill) {
                 loadedCount++;
                 log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+                currentRun?.detail('models', `${loadedCount} of ${totalMain} placed`);
             }
             return;
         }
@@ -1826,9 +1837,13 @@ async function buildScene(config) {
             if (loaded) loaded.userData._keyword = m.keyword;
             if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
             if (!isFill) {
-                loadedCount++;
+                if (loaded) loadedCount++; else missingCount++;
                 log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+                currentRun?.detail('models', `${loadedCount} of ${totalMain} placed`);
             }
+        } else if (!isFill) {
+            missingCount++;
+            log(`No model for "${m.keyword}"`, 'scene');
         }
     }
 
@@ -1840,63 +1855,295 @@ async function buildScene(config) {
     ];
     await Promise.all(loadPromises);
 
-    log(`All ${totalMain} models placed`, 'scene', 'model-progress');
+    log(`${loadedCount} of ${totalMain} models placed`, 'scene', 'model-progress');
 
     // Clean up remaining placeholders and stop animation
     if (phAnimId) cancelAnimationFrame(phAnimId);
     placeholders.forEach(ph => { if (ph.parent) scene.remove(ph); ph.geometry.dispose(); ph.material.dispose(); });
+    return { placed: loadedCount, missing: missingCount, total: totalMain };
 }
 
-// Console logging
-const LOG_ICONS = {
-    system: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2.5" fill="white"/></svg>`,
-    agent:  `<svg width="8" height="8" viewBox="0 0 8 8"><rect x="1" y="1" width="6" height="6" rx="1" fill="white"/></svg>`,
-    success:`<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1.5 4.5L3 6 6.5 2" stroke="white" stroke-width="1.3" fill="none"/></svg>`,
-    error:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 2l4 4M6 2l-4 4" stroke="white" stroke-width="1.3"/></svg>`,
-    motion: `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 1v6l5-3z" fill="white"/></svg>`,
-    scene:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6L4 2l3 4z" fill="white"/></svg>`,
-    render: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2" fill="none" stroke="white" stroke-width="1.2"/><circle cx="4" cy="4" r="0.8" fill="white"/></svg>`,
-    path:   `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6Q4 1 7 6" stroke="white" stroke-width="1.2" fill="none"/></svg>`,
-    user:   `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="2.5" r="1.5" fill="white"/><path d="M1.5 7a2.5 2.5 0 015 0" fill="white"/></svg>`,
-    music:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M3 1v5M6 0v4.5" stroke="white" stroke-width="1.2"/><circle cx="2" cy="6" r="1.2" fill="white"/><circle cx="5" cy="5" r="1.2" fill="white"/></svg>`,
-};
+// ========== ACTIVITY: run tracker, GPU state, detail log ==========
+const PAGE_T0 = performance.now();
+function fmtSecs(ms) {
+    const sec = Math.max(0, ms) / 1000;
+    if (sec < 60) return sec.toFixed(1) + 's';
+    return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+}
+function h(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+}
 
+// Detail log: plain lines under the "Details" disclosure.
 function log(msg, type = 'system', id = null) {
-    const console_el = document.getElementById('console');
-
-    // If an id is provided, update existing line instead of creating new one
+    const list = document.getElementById('log-list');
     if (id) {
         const existing = document.getElementById('log-' + id);
-        if (existing) {
-            existing.querySelector('.log-msg').textContent = msg;
-            console_el.scrollTop = console_el.scrollHeight;
-            return existing;
-        }
+        if (existing) { existing.querySelector('.log-msg').textContent = msg; return existing; }
     }
-
-    const line = document.createElement('div');
-    line.className = `log-line log-${type}`;
+    const line = h('div', `log-line log-${type}`);
     if (id) line.id = 'log-' + id;
-
-    const icon = document.createElement('div');
-    icon.className = 'log-icon';
-    icon.innerHTML = LOG_ICONS[type] || LOG_ICONS.system;
-
-    const msgEl = document.createElement('span');
-    msgEl.className = 'log-msg';
-    msgEl.textContent = msg;
-
-    line.appendChild(icon);
-    line.appendChild(msgEl);
-    console_el.appendChild(line);
-    console_el.scrollTop = console_el.scrollHeight;
+    const sec = Math.floor((performance.now() - PAGE_T0) / 1000);
+    line.append(h('span', 'log-t', `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`), h('span', 'log-msg', msg));
+    list.appendChild(line);
+    while (list.children.length > 300) list.firstChild.remove();
     return line;
 }
 
-function setPill(id, active) {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle('active', active);
+function setPill() {} // legacy no-op
+
+// --- Motion server (GPU) state ---
+// /health only answers once the model is loaded, so a slow reply means a cold GPU.
+const gpu = { state: 'checking', since: performance.now(), info: null, lastOk: 0 };
+const COLD_START_NOTE = 'The motion model runs on a Modal L4 GPU that sleeps when idle. Waking it and loading the model takes about 90 seconds the first time; after that a motion takes about 7.';
+
+function setGpu(state, info) {
+    if (state !== gpu.state) gpu.since = performance.now();
+    gpu.state = state;
+    if (info) gpu.info = info;
+    if (state === 'ready') gpu.lastOk = performance.now();
+    renderGpu();
 }
+
+function renderGpu() {
+    const secs = Math.floor((performance.now() - gpu.since) / 1000);
+    const name = gpu.info?.gpu || 'L4';
+    const pillText = {
+        checking: 'Connecting',
+        warming: `Warming up GPU ${secs}s`,
+        ready: `${name} GPU ready`,
+        offline: 'Motion server offline',
+    }[gpu.state];
+    const longText = {
+        checking: 'Connecting to the motion model',
+        warming: `The motion model is waking up on a Modal ${name} GPU (${secs}s). A cold start takes about 90 s.`,
+        ready: `Motion model ready on a Modal ${name} GPU`,
+        offline: 'Motion server unreachable. Generation will fail until it is back.',
+    }[gpu.state];
+    const pill = document.getElementById('gpu-pill');
+    pill.dataset.state = gpu.state;
+    document.getElementById('gpu-text').textContent = pillText;
+    pill.title = gpu.state === 'offline' ? 'Retry' : longText;
+    const w = document.getElementById('w-status');
+    w.dataset.state = gpu.state;
+    document.getElementById('w-status-text').textContent = longText;
+}
+
+async function checkHealth() {
+    setGpu('checking');
+    const slow = setTimeout(() => { if (gpu.state === 'checking') setGpu('warming'); }, 2500);
+    try {
+        const res = await fetch(`${API}/health`);
+        if (!res.ok) throw new Error(`health ${res.status}`);
+        const info = await res.json();
+        setGpu('ready', info);
+        log(`Motion model ready: ${info.model} on Modal ${info.gpu}` + (info.load_seconds ? ` (loaded in ${info.load_seconds}s)` : ''), 'success');
+    } catch (e) {
+        if (gpu.state !== 'ready') setGpu('offline');
+        log('Motion server unreachable, generation will fail', 'error');
+    }
+    clearTimeout(slow);
+}
+document.getElementById('gpu-pill').addEventListener('click', () => { if (gpu.state === 'offline') checkHealth(); });
+
+// What the motion step says while it waits on the server.
+function motionWaitText() {
+    const idle = gpu.lastOk && performance.now() - gpu.lastOk > 290000; // Modal scales down after 300 s idle
+    if (gpu.state === 'ready' && !idle) return `Kimodo on a Modal ${gpu.info?.gpu || 'L4'} GPU`;
+    if (gpu.state === 'offline') return 'Trying the motion server';
+    return 'Waiting for the GPU to warm up, about 90 s on a cold start';
+}
+function motionReceived() {
+    if (gpu.state !== 'ready') setGpu('ready');
+    else gpu.lastOk = performance.now();
+}
+
+// --- Runs: one per prompt, each a short list of honest steps ---
+const STEP_ICON = {
+    done: '<svg viewBox="0 0 10 10"><path d="M2.2 5.3l1.9 1.9L7.9 3.2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    failed: '<svg viewBox="0 0 10 10"><path d="M3 3l4 4M7 3l-4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+};
+const runs = [];
+let currentRun = null;
+
+class Run {
+    constructor(title, steps, kind) {
+        this.title = title;
+        this.kind = kind;
+        this.t0 = performance.now();
+        this.t1 = null;
+        this.state = 'running';
+        this.summary = '';
+        this.steps = steps.map(([id, label]) => ({ id, label, state: 'pending', detail: '', t0: 0, t1: 0 }));
+        runs.push(this);
+        currentRun = this;
+        renderRuns();
+    }
+    step(id) { return this.steps.find(s => s.id === id); }
+    add(id, label) {
+        if (!this.step(id)) this.steps.push({ id, label, state: 'pending', detail: '', t0: 0, t1: 0 });
+        renderRuns();
+    }
+    start(id, detail = '') {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'active', detail, t0: performance.now() });
+        renderRuns();
+    }
+    detail(id, detail) {
+        const s = this.step(id); if (!s || s.detail === detail) return;
+        s.detail = detail;
+        renderRuns();
+    }
+    done(id, detail) {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'done', t1: performance.now() });
+        if (!s.t0) s.t0 = s.t1;
+        if (detail != null) s.detail = detail;
+        renderRuns();
+    }
+    fail(id, detail) {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'failed', t1: performance.now(), detail });
+        if (!s.t0) s.t0 = s.t1;
+        renderRuns();
+    }
+    failActive(detail) {
+        const s = this.steps.find(x => x.state === 'active') || this.steps.find(x => x.state === 'pending');
+        if (s) this.fail(s.id, detail);
+    }
+    finish(summary = '') {
+        this.t1 = performance.now();
+        this.state = this.steps.some(s => s.state === 'failed') ? 'failed' : 'done';
+        this.summary = summary;
+        this.steps.forEach(s => { if (s.state === 'pending') s.state = 'skipped'; });
+        renderRuns();
+        if (this.kind === 'chat') {
+            clearTimeout(this._hide);
+            this._hide = setTimeout(() => { if (currentRun === this) renderPromptStatus(true); }, this.state === 'failed' ? 7000 : 2600);
+        }
+    }
+}
+
+function stepTime(s) {
+    if (s.state === 'active') return fmtSecs(performance.now() - s.t0);
+    if (s.state === 'done' || s.state === 'failed') return fmtSecs(s.t1 - s.t0);
+    return '';
+}
+function runMeta(r) {
+    if (r.state === 'running') return `Running ${fmtSecs(performance.now() - r.t0)}`;
+    if (r.state === 'failed') return `Failed after ${fmtSecs(r.t1 - r.t0)}`;
+    return `Done in ${fmtSecs(r.t1 - r.t0)}` + (r.summary ? ` · ${r.summary}` : '');
+}
+
+function buildSteps(run) {
+    const list = h('div', 'steps');
+    run.steps.forEach((s, i) => {
+        const row = h('div', `step ${s.state}`);
+        const icon = h('div', 'step-icon');
+        icon.innerHTML = STEP_ICON[s.state] || '';
+        const body = h('div', 'step-body');
+        body.append(h('div', 'step-label', s.label));
+        const det = h('div', 'step-detail', s.detail);
+        if (!s.detail) det.style.display = 'none';
+        det.dataset.detail = `${runs.indexOf(run)}:${i}`;
+        body.append(det);
+        const time = h('div', 'step-time', stepTime(s));
+        time.dataset.tick = `${runs.indexOf(run)}:${i}`;
+        row.append(icon, body, time);
+        list.append(row);
+    });
+    return list;
+}
+
+function renderRuns() {
+    const runsEl = document.getElementById('runs');
+    runsEl.replaceChildren();
+    const latest = runs[runs.length - 1];
+    if (latest) {
+        const card = h('div', 'run');
+        card.append(h('div', 'run-title', latest.title));
+        const meta = h('div', `run-meta ${latest.state}`, runMeta(latest));
+        meta.dataset.meta = String(runs.length - 1);
+        card.append(meta, buildSteps(latest));
+        runsEl.append(card);
+    }
+    const prev = runs.slice(0, -1).slice(-6).reverse();
+    if (prev.length) {
+        const hist = h('div', 'run-history');
+        for (const r of prev) {
+            const row = h('div', `run-prev ${r.state}`);
+            row.append(h('span', 'rp-dot'), h('span', 'rp-title', r.title), h('span', 'rp-time', r.t1 ? fmtSecs(r.t1 - r.t0) : ''));
+            row.title = r.title;
+            hist.append(row);
+        }
+        runsEl.append(hist);
+    }
+    const reopen = document.getElementById('panel-reopen');
+    reopen.dataset.state = latest ? latest.state : '';
+    renderGenOverlay();
+    renderPromptStatus();
+}
+
+// First-scene loading card in the middle of the viewport.
+let overlayRun = null;
+function renderGenOverlay() {
+    const ov = document.getElementById('gen-overlay');
+    if (!overlayRun) { ov.classList.remove('visible'); return; }
+    ov.classList.add('visible');
+    document.getElementById('go-prompt').textContent = overlayRun.title;
+    document.getElementById('go-steps').replaceChildren(buildSteps(overlayRun));
+    const failed = overlayRun.state === 'failed';
+    document.querySelector('.go-eyebrow').textContent = failed ? 'Generation failed' : 'Building your scene';
+    const m = overlayRun.step('motion');
+    const waitingOnGpu = m && m.state === 'active' && gpu.state !== 'ready';
+    document.getElementById('go-note').textContent = waitingOnGpu ? COLD_START_NOTE : '';
+    document.getElementById('go-actions').classList.toggle('visible', failed);
+}
+
+// One-line status above the prompt bar for follow-up requests.
+function renderPromptStatus(hide = false) {
+    const el = document.getElementById('prompt-status');
+    const r = currentRun;
+    if (hide || !r || r.kind !== 'chat') { el.classList.remove('visible', 'failed'); return; }
+    const active = r.steps.find(s => s.state === 'active');
+    const failedStep = r.steps.find(s => s.state === 'failed');
+    let text;
+    if (failedStep) text = `${failedStep.label} failed: ${failedStep.detail}`;
+    else if (active) text = active.detail ? `${active.label}: ${active.detail}` : `${active.label}...`;
+    else if (r.state === 'done') text = r.summary || 'Done';
+    else text = 'Working...';
+    el.replaceChildren();
+    if (r.state === 'running' || failedStep) el.append(h('span', 'ps-spin'));
+    el.append(h('span', 'ps-text', text));
+    if (r.state === 'running') { const t = h('span', 'ps-time', fmtSecs(performance.now() - r.t0)); t.dataset.psTime = '1'; el.append(t); }
+    el.classList.add('visible');
+    el.classList.toggle('failed', !!failedStep);
+}
+
+// Live clocks: update only the time text so spinners keep spinning.
+setInterval(() => {
+    if (gpu.state === 'warming') renderGpu();
+    const running = runs.some(r => r.state === 'running');
+    if (!running) return;
+    document.querySelectorAll('[data-tick]').forEach(el => {
+        const [ri, si] = el.dataset.tick.split(':').map(Number);
+        const s = runs[ri]?.steps[si];
+        if (s) el.textContent = stepTime(s);
+    });
+    document.querySelectorAll('[data-meta]').forEach(el => {
+        const r = runs[Number(el.dataset.meta)];
+        if (r) el.textContent = runMeta(r);
+    });
+    const ps = document.querySelector('[data-ps-time]');
+    if (ps && currentRun) ps.textContent = fmtSecs(performance.now() - currentRun.t0);
+    // Keep the motion step's wait message in step with the GPU state.
+    const r = currentRun;
+    const m = r && r.step('motion');
+    if (m && m.state === 'active' && !m.detail.startsWith('Take ')) r.detail('motion', motionWaitText());
+}, 200);
 
 // Generate
 const btn = document.getElementById('generate-btn');
@@ -1911,30 +2158,29 @@ async function generate() {
     const duration = 5; // Default duration for initial generation
 
     btn.disabled = true;
-    btn.textContent = 'Generating...';
     document.getElementById('welcome').classList.add('hidden');
-    setPanelOpen(true);
-
-    const shimmer = document.createElement('div');
-    shimmer.className = 'shimmer';
-    viewport.appendChild(shimmer);
+    setPanelOpen(false);
+    document.getElementById('panel-reopen').classList.remove('visible');
 
     log(`> "${prompt}"`, 'agent');
-    const startTime = Date.now();
+    const run = new Run(prompt, [['motion', 'Motion'], ['scene', 'Scene plan'], ['models', 'Models'], ['animate', 'Animation']], 'generate');
+    overlayRun = run;
+    renderGenOverlay();
 
     try {
         // === STEP 1: Generate motion FIRST to get character path ===
         // Silently enhance the motion prompt for better demo results.
         // Bias toward locomotion and exaggerated movement — never shown to user.
         const motionPrompt = enhanceMotionPrompt(prompt);
-
-        setPill('pill-motion', true);
+        run.start('motion', motionWaitText());
         log(`Generating motion (${duration}s)...`, 'motion');
 
         const MIN_TRAVEL_DIST = 50; // minimum distance between start and end
         const MAX_RETRIES = 3;
         let bvhText = null;
         let characterPath = null;
+        let clipSeconds = duration;
+        let travelDist = 0;
 
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             const motionStart = Date.now();
@@ -1945,17 +2191,19 @@ async function generate() {
             });
             if (!motionRes.ok) throw new Error(await motionError(motionRes));
             bvhText = await motionRes.text();
+            motionReceived();
 
             const motionElapsed = ((Date.now() - motionStart) / 1000).toFixed(1);
 
             // Check if character actually moved
-            const { path } = extractPathFromBVH(bvhText);
+            const { path, result } = extractPathFromBVH(bvhText);
             characterPath = path;
+            clipSeconds = result.clip.duration;
 
             if (path.length >= 2) {
                 const startPt = path[0];
                 const endPt = path[path.length - 1];
-                const travelDist = Math.sqrt(
+                travelDist = Math.sqrt(
                     (endPt[0] - startPt[0]) ** 2 + (endPt[2] - startPt[2]) ** 2
                 );
 
@@ -1963,31 +2211,34 @@ async function generate() {
                     log(`Motion received (${(bvhText.length / 1024).toFixed(0)}KB, ${motionElapsed}s)`, 'motion');
                     break;
                 }
+                log(`Take ${attempt + 1} only moved ${Math.round(travelDist)}cm, asking for another`, 'motion');
+                run.detail('motion', `Take ${attempt + 2} of ${MAX_RETRIES + 1}: the last one barely moved`);
             } else {
                 break;
             }
         }
 
-        setPill('pill-motion', false);
         log(`Extracted ${characterPath.length} waypoints`, 'path');
+        run.done('motion', `${clipSeconds.toFixed(1)} s clip, travels ${(travelDist / 100).toFixed(1)} m`);
 
         // === STEP 3: Plan scene AROUND the path ===
-        setPill('pill-scene', true);
+        run.start('scene', 'Gemini picks what belongs in the scene');
         log('Planning scene layout...', 'scene');
 
         const config = await callGemini(prompt, characterPath);
         config._characterPath = characterPath;
         config._prompt = prompt;
-        const geminiElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         const modelCount = (config.scene.models || []).length;
-        log(`Planned ${modelCount} models (${geminiElapsed}s)`, 'scene');
+        log(`Planned ${modelCount} models`, 'scene');
+        run.done('scene', `${modelCount} objects, ${config.scene.type || 'outdoor'}`);
 
         // === STEP 4: Build scene + load animation ===
-        await buildScene(config);
+        run.start('models', 'Loading models');
+        const stats = await buildScene(config);
         log('Scene built', 'scene');
-        setPill('pill-scene', false);
+        run.done('models', `${stats.placed} placed` + (stats.missing ? `, ${stats.missing} not in the library` : ''));
 
-        setPill('pill-render', true);
+        run.start('animate', 'Putting the motion on the character');
         log('Loading animation...', 'render');
         await loadBVH(bvhText);
         prepareCharacter();
@@ -2001,25 +2252,30 @@ async function generate() {
         const pathBtn = document.getElementById('path-toggle');
         pathBtn.style.display = '';
         pathBtn.classList.remove('active');
-        pathBtn.textContent = 'Show Path';
+        pathBtn.textContent = 'Show path';
 
         // Initialize timeline with first clip
         timelineClips = [{ prompt: prompt, duration: currentClip.duration, clip: currentClip }];
         totalDuration = currentClip.duration;
         renderTimelineClips();
         showTimeline();
-        document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+        setPlayIcon(true);
         isPlaying = true;
 
         log('Scene complete', 'render');
         cam.active = true;
+        controls.autoRotate = false;
         frameCharacter(true);
         showEditor();
         showPromptDock();
-        setPill('pill-render', false);
+        run.done('animate', 'Playing');
+        run.finish(`${stats.placed} models`);
 
-        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        log(`Total generation time: ${totalElapsed}s`, 'system');
+        log(`Total generation time: ${fmtSecs(run.t1 - run.t0)}`, 'system');
+        overlayRun = null;
+        renderGenOverlay();
+        // Desktop keeps the tracker in view; phones keep the scene clear.
+        setPanelOpen(window.innerWidth > 860);
 
         // Generate soundtrack in background (non-blocking)
         // Music disabled during live playback — only plays during video render
@@ -2027,16 +2283,22 @@ async function generate() {
 
     } catch (err) {
         log(`Error: ${err.message}`, 'error');
-        setPill('pill-scene', false);
-        setPill('pill-motion', false);
-        setPill('pill-render', false);
+        run.failActive(err.message);
+        run.finish();
     }
 
-    shimmer.remove();
     btn.disabled = false;
-    btn.textContent = 'Generate';
     isGenerating = false;
 }
+
+// Failed first scene: try the same prompt again, or go back to the start.
+document.getElementById('go-retry').addEventListener('click', () => { overlayRun = null; generate(); });
+document.getElementById('go-back').addEventListener('click', () => {
+    overlayRun = null;
+    renderGenOverlay();
+    if (currentClip) setPanelOpen(window.innerWidth > 860);
+    else showWelcome();
+});
 
 btn.addEventListener('click', generate);
 input.addEventListener('keydown', e => {
@@ -2044,11 +2306,12 @@ input.addEventListener('keydown', e => {
 });
 
 // Welcome screen
-document.getElementById('logo-btn').addEventListener('click', () => {
+function showWelcome() {
     document.getElementById('welcome').classList.remove('hidden');
     document.getElementById('welcome-input').value = '';
     document.getElementById('welcome-input').focus();
-});
+}
+document.getElementById('logo-btn').addEventListener('click', () => { if (!isGenerating) showWelcome(); });
 
 function dismissWelcome(prompt) {
     input.value = prompt;
@@ -2125,7 +2388,7 @@ function blockersBetween(camPos, focus) {
     const out = [];
     for (const { obj, box } of modelBoxes()) {
         if (obj === selectedObject) continue;
-        if (box.distanceToPoint(camPos) < 60) { out.push(obj); continue; } // in front of the lens
+        if (box.distanceToPoint(camPos) < 140) { out.push(obj); continue; } // right in front of the lens
         for (const p of pts) {
             if (box.containsPoint(p)) continue; // character is inside this box (under a canopy)
             const len = camPos.distanceTo(p);
@@ -2319,9 +2582,6 @@ function prepareCharacter() {
 }
 animate();
 
-// Initial welcome messages
-log('Kinetik v0.1', 'system');
-log('Type a prompt or pick a scene to start', 'system');
 
 async function motionError(res) {
     try {
@@ -2333,15 +2593,8 @@ async function motionError(res) {
 
 // Report what the motion server actually says instead of assuming it is up.
 // This also warms a GPU container while the user is still typing.
-(async () => {
-    try {
-        const res = await fetch(`${API}/health`);
-        const h = await res.json();
-        log(`Motion model ready: ${h.model} on Modal ${h.gpu}`, 'success');
-    } catch {
-        log('Motion server unreachable, generation will fail', 'error');
-    }
-})();
+renderGpu();
+checkHealth();
 
 // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
 const WELCOME_MOTIONS = [
@@ -2679,6 +2932,10 @@ function mergeClips(clipA, clipB, blendTime) {
     return new THREE.AnimationClip('merged', clipA.duration + clipB.duration, mergedTracks);
 }
 
+function setPlayIcon(playing) {
+    document.getElementById('tl-playpause').innerHTML = playing ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+}
+
 function showTimeline() {
     document.getElementById('timeline-bar').classList.add('visible');
 }
@@ -2827,7 +3084,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === ' ') {
         e.preventDefault();
         isPlaying = !isPlaying;
-        document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+        setPlayIcon(isPlaying);
         return;
     }
 
@@ -2860,7 +3117,7 @@ document.addEventListener('keydown', (e) => {
 // Play/Pause button
 document.getElementById('tl-playpause').addEventListener('click', () => {
     isPlaying = !isPlaying;
-    document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+    setPlayIcon(isPlaying);
 });
 
 // Deselect timeline clip when clicking outside
@@ -2949,9 +3206,9 @@ async function classifyChat(userMsg) {
             generationConfig: { temperature: 0.2 }
         })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Empty classification response');
+    if (!text) throw new Error(geminiProblem(res, data));
     const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     return JSON.parse(clean);
 }
@@ -2994,6 +3251,9 @@ async function handleAddObject(params) {
     const targetScale = sizeScales[params.size] || 100;
 
     log(`Adding "${params.keyword}" (${params.direction || 'random'})...`, 'scene', 'chat-action');
+    const run = currentRun;
+    run?.add('place', 'Place object');
+    run?.start('place', `${params.keyword}, ${params.direction || 'anywhere'}`);
 
     // Try procedural first
     const procedural = tryProceduralModel(params.keyword, targetScale);
@@ -3004,6 +3264,7 @@ async function handleAddObject(params) {
         scene.add(procedural);
         sceneObjects.push(procedural);
         log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+        run?.done('place', `Placed ${params.keyword}`);
         return;
     }
 
@@ -3012,9 +3273,16 @@ async function handleAddObject(params) {
     if (glbUrl) {
         const loaded = await loadGLBModel(glbUrl, position, targetScale, Math.random() * Math.PI * 2);
         if (loaded) loaded.userData._keyword = params.keyword;
-        log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+        if (loaded) {
+            log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+            run?.done('place', `Placed ${params.keyword}`);
+        } else {
+            log(`Could not load "${params.keyword}" model`, 'error', 'chat-action');
+            run?.fail('place', `Could not load the ${params.keyword} model`);
+        }
     } else {
         log(`Could not find "${params.keyword}" model`, 'error', 'chat-action');
+        run?.fail('place', `No ${params.keyword} in the model library`);
     }
 }
 
@@ -3040,7 +3308,10 @@ async function handleAddMotion(params) {
     }
 
     log(`Generating motion (${dur}s)...`, 'motion', 'chat-action');
-    setPill('pill-motion', true);
+    const run = currentRun;
+    run?.add('motion', 'Motion');
+    run?.add('blend', 'Timeline');
+    run?.start('motion', motionWaitText());
 
     try {
         const res = await fetch(`${API}/generate-motion`, {
@@ -3049,6 +3320,9 @@ async function handleAddMotion(params) {
         });
         if (!res.ok) throw new Error(await motionError(res));
         const bvh = await res.text();
+        motionReceived();
+        run?.done('motion', `${Number(dur).toFixed(1)} s clip`);
+        run?.start('blend', 'Blending onto the end of the timeline');
 
         let newClip;
         if (targetAngle !== null) {
@@ -3079,26 +3353,39 @@ async function handleAddMotion(params) {
         if (groundMesh) applyTerrainFromPath(groundMesh, fullPath);
 
         log(`Added motion: "${params.prompt}" (${newClip.duration.toFixed(1)}s)`, 'success', 'chat-action');
+        run?.done('blend', `Clip ${timelineClips.length} added, ${newClip.duration.toFixed(1)} s`);
     } catch (err) {
         log(`Error: ${err.message}`, 'error', 'chat-action');
+        run?.failActive(err.message);
     }
-    setPill('pill-motion', false);
 }
 
 // Handle modify_scene action
 function handleModifyScene(params) {
     const changes = params.changes || {};
+    const run = currentRun;
+    run?.add('apply', 'Scene change');
+    run?.start('apply');
+    const did = [];
     if (changes.ground_color && groundMesh) {
         groundMesh.material.color.set(changes.ground_color);
         log(`Ground color changed to ${changes.ground_color}`, 'scene');
+        did.push('ground color');
     }
     if (changes.ambient_intensity !== undefined) {
-        scene.traverse(obj => {
-            if (obj.isAmbientLight) obj.intensity = changes.ambient_intensity;
-        });
+        const base = (ENV_PRESETS[envName] || ENV_PRESETS.day).hemiI;
+        hemiLight.intensity = THREE.MathUtils.clamp(base * changes.ambient_intensity, 0.2, 4);
         log(`Ambient light set to ${changes.ambient_intensity}`, 'scene');
+        did.push('light');
+    }
+    if (typeof changes.fog === 'boolean' && scene.fog) {
+        const f = (ENV_PRESETS[envName] || ENV_PRESETS.day).fog;
+        scene.fog.near = changes.fog ? 150 : f[0];
+        scene.fog.far = changes.fog ? 1400 : f[1];
+        did.push(changes.fog ? 'fog on' : 'fog off');
     }
     log('Scene updated', 'success');
+    run?.done('apply', did.length ? `Changed ${did.join(', ')}` : 'Nothing to change');
 }
 
 // Main chat handler
@@ -3109,9 +3396,14 @@ async function handleChat(userMsg) {
     chatInput.placeholder = 'Working on it...';
     syncChatSend();
     log(`> ${userMsg}`, 'user');
+    const run = new Run(userMsg, [['understand', 'Understand']], 'chat');
+    run.start('understand', 'Gemini reads the request');
 
     try {
         const intent = await classifyChat(userMsg);
+        const what = { add_motion: 'A new motion', add_object: 'An object to add', modify_scene: 'A scene change' }[intent.action];
+        if (what) run.done('understand', what);
+        else run.fail('understand', 'Not sure what that means. Try a motion, an object, or a scene change.');
 
         switch (intent.action) {
             case 'add_motion':
@@ -3128,7 +3420,10 @@ async function handleChat(userMsg) {
         }
     } catch (err) {
         log(`Error: ${err.message}`, 'error');
+        run.failActive(err.message);
     }
+    const last = run.steps[run.steps.length - 1];
+    run.finish(run.steps.some(s => s.state === 'failed') ? '' : (last.detail || 'Done'));
 
     chatInput.disabled = false;
     chatInput.placeholder = CHAT_PLACEHOLDER;
@@ -3852,11 +4147,12 @@ async function handleImportFile(e) {
             totalDuration = currentClip.duration;
             renderTimelineClips();
             showTimeline();
-            document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+            setPlayIcon(true);
             isPlaying = true;
         }
 
         cam.active = true;
+        controls.autoRotate = false;
         // Restore camera
         if (data.camera) {
             camera.position.set(...data.camera.position);
