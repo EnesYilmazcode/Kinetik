@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { createCharacter } from './character.js';
 
 // Kimodo motion server on Modal (scripts/modal_app.py). Override with ?api=<url>.
 const API = new URLSearchParams(location.search).get('api')
@@ -78,92 +79,9 @@ function removeSelectionBox() {
         selectionBox = null;
     }
 }
-let somaGeometry = null;
-let somaSkinData = null;
-let somaBindInverses = null;
 let skinnedCharMesh = null;
+let character = null;
 
-// BVH joint names in the order the skin data references them
-const BVH_JOINT_NAMES = ['Hips','Spine1','Spine2','Chest','Neck1','Neck2','Head','HeadEnd','Jaw','LeftEye','RightEye','LeftShoulder','LeftArm','LeftForeArm','LeftHand','RightShoulder','RightArm','RightForeArm','RightHand','LeftLeg','LeftShin','LeftFoot','LeftToeBase','LeftToeEnd','RightLeg','RightShin','RightFoot','RightToeBase','RightToeEnd'];
-
-// Load the SOMA mesh + skin data (cached after first load)
-async function loadSomaMesh() {
-    if (somaGeometry && somaSkinData && somaBindInverses) return;
-
-    // Load GLB mesh
-    const glb = await new Promise((resolve, reject) => {
-        gltfLoader.load('assets/character/soma_mesh.glb', resolve, undefined, reject);
-    });
-    // Find the first Mesh in the GLB (may be nested)
-    let mesh = null;
-    glb.scene.traverse(child => { if (!mesh && child.isMesh) mesh = child; });
-    if (!mesh) throw new Error('No mesh found in GLB');
-    somaGeometry = mesh.geometry.clone();
-
-    // Scale from meters to BVH units (~100x)
-    const posAttr = somaGeometry.getAttribute('position');
-    for (let i = 0; i < posAttr.count; i++) {
-        posAttr.setXYZ(i, posAttr.getX(i) * 100, posAttr.getY(i) * 100, posAttr.getZ(i) * 100);
-    }
-    posAttr.needsUpdate = true;
-    somaGeometry.computeVertexNormals();
-
-    // Load skin data binary (4 uint8 indices + 4 float16 weights per vertex)
-    const resp = await fetch('assets/character/soma_skin.bin');
-    const buf = await resp.arrayBuffer();
-    const view = new DataView(buf);
-    const vertCount = posAttr.count;
-
-    const skinIndices = new Uint16Array(vertCount * 4);
-    const skinWeights = new Float32Array(vertCount * 4);
-
-    for (let v = 0; v < vertCount; v++) {
-        const off = v * 12; // 4 bytes indices + 8 bytes weights
-        for (let j = 0; j < 4; j++) {
-            skinIndices[v * 4 + j] = view.getUint8(off + j);
-        }
-        for (let j = 0; j < 4; j++) {
-            // float16 read
-            skinWeights[v * 4 + j] = readFloat16(view, off + 4 + j * 2);
-        }
-    }
-
-    somaGeometry.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
-    somaGeometry.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
-    somaSkinData = true;
-
-    // Load RAW bind transforms, scale translation, then invert in JS
-    const bindResp = await fetch('assets/character/soma_bind_raw.bin');
-    const bindBuf = await bindResp.arrayBuffer();
-    const bindFloats = new Float32Array(bindBuf); // 29 * 16 = 464 floats
-    somaBindInverses = [];
-    for (let i = 0; i < 29; i++) {
-        const r = bindFloats.subarray(i * 16, (i + 1) * 16);
-        // NumPy stores row-major: [r0c0, r0c1, r0c2, r0c3, r1c0, r1c1, ...]
-        // Three.js .elements stores column-major: [c0r0, c0r1, c0r2, c0r3, c1r0, ...]
-        // So we need to transpose when writing to .elements
-        const bindMat = new THREE.Matrix4();
-        bindMat.elements[0]  = r[0];  bindMat.elements[1]  = r[4];  bindMat.elements[2]  = r[8];   bindMat.elements[3]  = r[12];
-        bindMat.elements[4]  = r[1];  bindMat.elements[5]  = r[5];  bindMat.elements[6]  = r[9];   bindMat.elements[7]  = r[13];
-        bindMat.elements[8]  = r[2];  bindMat.elements[9]  = r[6];  bindMat.elements[10] = r[10];  bindMat.elements[11] = r[14];
-        bindMat.elements[12] = r[3] * 100;  bindMat.elements[13] = r[7] * 100;  bindMat.elements[14] = r[11] * 100;  bindMat.elements[15] = r[15];
-
-        // Invert the bind matrix to get the inverse bind matrix
-        const invMat = bindMat.clone().invert();
-        somaBindInverses.push(invMat);
-    }
-}
-
-// Float16 reader
-function readFloat16(view, offset) {
-    const h = view.getUint16(offset, true);
-    const s = (h >> 15) & 1;
-    const e = (h >> 10) & 0x1f;
-    const f = h & 0x3ff;
-    if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
-    if (e === 31) return f ? NaN : (s ? -Infinity : Infinity);
-    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
-}
 let currentClip = null, currentAction = null;
 let isPlaying = true, isScrubbing = false;
 let lastBvhText = null;
@@ -435,46 +353,12 @@ function extractPathFromBVH(text) {
     return { path, result };
 }
 
-// Cache the human GLB model
-let humanModelTemplate = null;
-async function loadHumanModel() {
-    if (humanModelTemplate) {
-        const c = humanModelTemplate.clone();
-        // Preserve scale from template
-        c.scale.copy(humanModelTemplate.scale);
-        return c;
-    }
-    const glb = await new Promise((resolve, reject) => {
-        gltfLoader.load('assets/character/human.glb', resolve, undefined, reject);
-    });
-    // Wrap in a container group so we can scale the container
-    // (the GLB scene may have internal transforms we can't override)
-    const container = new THREE.Group();
-    container.add(glb.scene);
-
-    // Measure raw size
-    const box = new THREE.Box3().setFromObject(container);
-    const size = new THREE.Vector3();
-    box.getSize(size);
-
-    container.scale.setScalar(18.7);
-
-    // Center the model at origin and put feet at Y=0 relative to container
-    const sb = new THREE.Box3().setFromObject(container);
-    const center = new THREE.Vector3();
-    sb.getCenter(center);
-    // When attached to Hips bone (Y~94), we need feet at Y = -94 relative to Hips
-    container.position.set(-center.x, -sb.min.y - 94, -center.z);
-
-    humanModelTemplate = container;
-    return container;
-}
-
-function loadBVH(text) {
+async function loadBVH(text) {
     // Clear previous
     if (characterGroup) scene.remove(characterGroup);
     if (currentHelper) scene.remove(currentHelper);
-    if (skinnedCharMesh) { skinnedCharMesh = null; }
+    if (character) { character.dispose(); character = null; }
+    skinnedCharMesh = null;
     bodyMeshes.forEach(m => scene.remove(m));
     bodyMeshes = [];
 
@@ -487,7 +371,20 @@ function loadBVH(text) {
     scene.add(characterGroup);
     currentHelper = null;
 
-    createBodyMeshes(currentBones);
+    // Skinned human; the capsule mannequin is only a fallback if it fails to load.
+    const group = characterGroup;
+    let footClearance = 2;
+    try {
+        const c = await createCharacter(currentBones, THREE, GLTFLoader);
+        if (group !== characterGroup) { c.dispose(); return; } // a newer clip replaced this one
+        character = c;
+        skinnedCharMesh = c.object;
+        group.add(c.object);
+        footClearance = c.footClearance;
+    } catch (e) {
+        console.warn('Character failed to load, using mannequin', e);
+        createBodyMeshes(currentBones);
+    }
 
     // Use a SINGLE mixer for both sampling and playback.
     // Previous approach (tempMixer + setTime + uncacheRoot) was unreliable.
@@ -519,10 +416,8 @@ function loadBVH(text) {
         }
     }
 
-    // Ground the character: offset so the lowest foot capsule bottom touches Y=0.
-    // Subtract the foot capsule bottom radius (2) so the visual mesh sits on the ground.
-    const footCapsuleRadius = 2;
-    characterGroup.position.y = -(globalMinY - footCapsuleRadius);
+    // Ground the character so the lowest sole touches Y=0.
+    characterGroup.position.y = -(globalMinY - footClearance);
 
     // Reset to beginning for clean playback
     currentAction.reset();
@@ -1964,7 +1859,7 @@ async function generate() {
 
         setPill('pill-render', true);
         log('Loading animation...', 'render');
-        loadBVH(bvhText);
+        await loadBVH(bvhText);
         lastBvhText = bvhText;
 
         // Build path visualization and apply terrain
@@ -2159,9 +2054,12 @@ let welcomeInterval = null;
     let wBodyMeshes = [];
     const wClock = new THREE.Clock();
 
-    function wLoadBVH(text) {
+    let wCharacter = null;
+
+    async function wLoadBVH(text) {
         // Clear previous
         if (wGroup) wScene.remove(wGroup);
+        if (wCharacter) { wCharacter.dispose(); wCharacter = null; }
         wBodyMeshes.forEach(m => wScene.remove(m));
         wBodyMeshes = [];
 
@@ -2173,63 +2071,74 @@ let welcomeInterval = null;
         wGroup.add(wBones);
         wScene.add(wGroup);
 
-        // Create body meshes using the same LatheGeometry approach as main scene
-        const mat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.6, metalness: 0.1 });
-        const tv1 = new THREE.Vector3(), tv2 = new THREE.Vector3();
+        let wFootClearance = 2;
+        try {
+            const group = wGroup;
+            const c = await createCharacter(wBones, THREE, GLTFLoader);
+            if (group !== wGroup) { c.dispose(); return 0; }
+            wCharacter = c;
+            group.add(c.object);
+            wFootClearance = c.footClearance;
+        } catch (e) {
+            // Create body meshes using the same LatheGeometry approach as main scene
+            const mat = new THREE.MeshStandardMaterial({ color: bodyColor, roughness: 0.6, metalness: 0.1 });
+            const tv1 = new THREE.Vector3(), tv2 = new THREE.Vector3();
 
-        // Head
-        const headBone = findBone(wBones, 'HeadEnd');
-        const headBase = findBone(wBones, 'Head');
-        if (headBone && headBase) {
-            const hMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 16), mat.clone());
-            hMesh.userData.type = 'head';
-            hMesh.userData.bone = headBone;
-            hMesh.userData.baseBone = headBase;
-            wScene.add(hMesh);
-            wBodyMeshes.push(hMesh);
-        }
-
-        // Body segments with LatheGeometry
-        for (const [fromName, toName, rTop, rBot] of BODY_SEGMENTS) {
-            const fromBone = findBone(wBones, fromName);
-            const toBone = findBone(wBones, toName);
-            if (!fromBone || !toBone) continue;
-
-            fromBone.getWorldPosition(tv1);
-            toBone.getWorldPosition(tv2);
-            const height = Math.max(tv1.distanceTo(tv2), 1);
-            const segments = 12;
-            const capSteps = 8;
-            const points = [];
-            for (let i = 0; i <= capSteps; i++) {
-                const angle = (Math.PI / 2) * (i / capSteps);
-                points.push(new THREE.Vector2(Math.sin(angle) * rBot, -height / 2 - Math.cos(angle) * rBot + rBot));
-            }
-            points.push(new THREE.Vector2(rBot, -height / 2 + rBot));
-            points.push(new THREE.Vector2(rTop, height / 2 - rTop));
-            for (let i = 0; i <= capSteps; i++) {
-                const angle = (Math.PI / 2) * (i / capSteps);
-                points.push(new THREE.Vector2(Math.cos(angle) * rTop, height / 2 + Math.sin(angle) * rTop - rTop));
-            }
-            const geo = new THREE.LatheGeometry(points, segments);
-            const mesh = new THREE.Mesh(geo, mat.clone());
-            mesh.userData.type = 'capsule';
-            mesh.userData.fromBone = fromBone;
-            mesh.userData.toBone = toBone;
-            wScene.add(mesh);
-            wBodyMeshes.push(mesh);
-        }
-
-        // Hands
-        for (const handName of ['LeftHand', 'RightHand']) {
-            const bone = findBone(wBones, handName);
-            if (bone) {
-                const hMesh = new THREE.Mesh(new THREE.SphereGeometry(3.5, 10, 8), mat.clone());
-                hMesh.userData.type = 'joint';
-                hMesh.userData.bone = bone;
+            // Head
+            const headBone = findBone(wBones, 'HeadEnd');
+            const headBase = findBone(wBones, 'Head');
+            if (headBone && headBase) {
+                const hMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 16), mat.clone());
+                hMesh.userData.type = 'head';
+                hMesh.userData.bone = headBone;
+                hMesh.userData.baseBone = headBase;
                 wScene.add(hMesh);
                 wBodyMeshes.push(hMesh);
             }
+
+            // Body segments with LatheGeometry
+            for (const [fromName, toName, rTop, rBot] of BODY_SEGMENTS) {
+                const fromBone = findBone(wBones, fromName);
+                const toBone = findBone(wBones, toName);
+                if (!fromBone || !toBone) continue;
+
+                fromBone.getWorldPosition(tv1);
+                toBone.getWorldPosition(tv2);
+                const height = Math.max(tv1.distanceTo(tv2), 1);
+                const segments = 12;
+                const capSteps = 8;
+                const points = [];
+                for (let i = 0; i <= capSteps; i++) {
+                    const angle = (Math.PI / 2) * (i / capSteps);
+                    points.push(new THREE.Vector2(Math.sin(angle) * rBot, -height / 2 - Math.cos(angle) * rBot + rBot));
+                }
+                points.push(new THREE.Vector2(rBot, -height / 2 + rBot));
+                points.push(new THREE.Vector2(rTop, height / 2 - rTop));
+                for (let i = 0; i <= capSteps; i++) {
+                    const angle = (Math.PI / 2) * (i / capSteps);
+                    points.push(new THREE.Vector2(Math.cos(angle) * rTop, height / 2 + Math.sin(angle) * rTop - rTop));
+                }
+                const geo = new THREE.LatheGeometry(points, segments);
+                const mesh = new THREE.Mesh(geo, mat.clone());
+                mesh.userData.type = 'capsule';
+                mesh.userData.fromBone = fromBone;
+                mesh.userData.toBone = toBone;
+                wScene.add(mesh);
+                wBodyMeshes.push(mesh);
+            }
+
+            // Hands
+            for (const handName of ['LeftHand', 'RightHand']) {
+                const bone = findBone(wBones, handName);
+                if (bone) {
+                    const hMesh = new THREE.Mesh(new THREE.SphereGeometry(3.5, 10, 8), mat.clone());
+                    hMesh.userData.type = 'joint';
+                    hMesh.userData.bone = bone;
+                    wScene.add(hMesh);
+                    wBodyMeshes.push(hMesh);
+                }
+            }
+
         }
 
         wMixer = new THREE.AnimationMixer(wBones);
@@ -2248,7 +2157,7 @@ let welcomeInterval = null;
                 if (b) { b.getWorldPosition(bp); if (bp.y < minY) minY = bp.y; }
             }
         }
-        wGroup.position.y = -(minY - 2);
+        wGroup.position.y = -(minY - wFootClearance);
         action.reset();
         action.setLoop(THREE.LoopOnce);
         action.clampWhenFinished = true;
@@ -2311,7 +2220,7 @@ let welcomeInterval = null;
         try {
             const r = await fetch(m.file);
             if (r.ok) {
-                const dur = wLoadBVH(await r.text());
+                const dur = await wLoadBVH(await r.text());
                 // Mirror on X if flagged
                 if (wGroup) wGroup.scale.x = m.mirror ? -1 : 1;
                 const label = document.getElementById('w-motion-label');
@@ -2327,10 +2236,10 @@ let welcomeInterval = null;
     // Schedule first transition after initial clip ends
     fetch(WELCOME_MOTIONS[0].file)
         .then(r => r.ok ? r.text() : null)
-        .then(text => {
+        .then(async text => {
             if (text) {
                 try {
-                    const dur = wLoadBVH(text);
+                    const dur = await wLoadBVH(text);
                     setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
                 } catch(e) { console.error('Welcome BVH parse error:', e); }
             }

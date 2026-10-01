@@ -53,6 +53,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 
 ## Key Features
 
+- **Skinned human character** — Kimodo's own SOMA body, clothed, driven directly by the generated BVH
 - **Motion timeline** — chain multiple animations with smooth 0.4s blend transitions
 - **Scene editor** — add, move, rotate, scale objects. Build mode activates on selection.
 - **Tabbed sidebar** — Activity log and Add panel side-by-side on the left for quick access
@@ -146,7 +147,7 @@ viewer.html               — standalone BVH animation viewer
 models/                   — 73 pre-generated .glb + .png assets
 assets/
   motions/                — sample BVH animations
-  character/              — SOMA character mesh + skeleton data
+  character/              — skinned human (Kimodo SOMA body, Apache-2.0) and its credits
   media/                  — README images and demo gif
 scripts/
   modal_app.py            — Kimodo motion server on Modal
