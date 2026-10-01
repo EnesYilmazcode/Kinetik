@@ -48,7 +48,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 4. **Three.js** renders everything together in the browser with a timeline editor
 
 <p align="center">
-  <img src="assets/media/scene-park-backflip.png" alt="Editor with two chained clips: a jog through a park at sunset, then a backflip" width="760">
+  <img src="assets/media/scene-park-stride.png" alt="Side view of the character mid-stride on a park trail, with a bench and a gazebo behind" width="760">
 </p>
 
 ## Key Features
@@ -67,7 +67,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 - **Prompt enhancement** — silently rewrites prompts for better Kimodo results
 
 <p align="center">
-  <img src="assets/media/render-park.gif" alt="Two chained clips: a jog through a park at sunset, then a backflip" width="720">
+  <img src="assets/media/render-walk-cartwheel.gif" alt="Two chained clips: a walk through a park, then a cartwheel" width="720">
 </p>
 
 ## Stack

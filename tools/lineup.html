@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kinetik asset lineup</title>
+<style>html,body{margin:0;background:#e9e6df}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+// Every library model at its real-world height (world.js ASSETS) beside a 175 cm person.
+// ?from=0&n=8 picks a slice; window.lineupReady flips when everything is loaded.
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { ASSETS } from '../world.js';
+
+const q = new URLSearchParams(location.search);
+const names = Object.keys(ASSETS).sort();
+const from = +(q.get('from') || 0), n = +(q.get('n') || 8);
+const pick = names.slice(from, from + n);
+
+const W = innerWidth, H = innerHeight;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#e9e6df');
+scene.add(new THREE.HemisphereLight(0xffffff, 0x998877, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(300, 800, 600);
+scene.add(sun);
+
+function label(text, x, y) {
+    const c = document.createElement('canvas');
+    c.width = 512; c.height = 96;
+    const g = c.getContext('2d');
+    g.fillStyle = '#222'; g.font = '600 40px sans-serif'; g.textAlign = 'center';
+    g.fillText(text, 256, 60);
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c) }));
+    s.scale.set(240, 45, 1);
+    s.position.set(x, y, 0);
+    scene.add(s);
+}
+function person(x) {
+    const m = new THREE.MeshStandardMaterial({ color: '#d0574b' });
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(18, 18, 145, 12), m);
+    body.position.set(x, 72.5, 0);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(15, 16, 12), m);
+    head.position.set(x, 160, 0);
+    scene.add(body, head);
+}
+function visibleBox(o) {
+    o.updateMatrixWorld(true);
+    const b = new THREE.Box3();
+    o.traverse(c => { if (c.isMesh && c.visible) b.expandByObject(c); });
+    return b;
+}
+
+const loader = new GLTFLoader();
+let x = 0, maxH = 200;
+for (const name of pick) {
+    const [h] = ASSETS[name];
+    const gltf = await loader.loadAsync(`../models/${name}.glb`).catch(() => null);
+    if (!gltf) continue;
+    const o = gltf.scene;
+    // Same material fix and artifact filter as the app.
+    o.traverse(c => {
+        if (c.isMesh && c.material && 'metalness' in c.material) {
+            c.material.metalness = 0;
+            c.material.roughness = Math.max(c.material.roughness, 0.75);
+        }
+        if (c.isMesh && c.material && !c.material.map && c.material.color) {
+            const k = c.material.color;
+            if ((k.r > 0.95 && k.g > 0.95 && k.b > 0.95) || (k.r < 0.08 && k.g < 0.08 && k.b < 0.08)) c.visible = false;
+        }
+    });
+    const size = visibleBox(o).getSize(new THREE.Vector3());
+    o.scale.setScalar(h / (size.y || 1));
+    const b = visibleBox(o), w = b.max.x - b.min.x;
+    person(x + 25);
+    o.position.set(x + 70 - b.min.x, -b.min.y, -(b.min.z + b.max.z) / 2);
+    scene.add(o);
+    label(`${name} ${h}cm`, x + 70 + w / 2, -40);
+    x += 70 + w + 90;
+    maxH = Math.max(maxH, h);
+}
+const cam = new THREE.OrthographicCamera(0, 1, 1, 0, -5000, 5000);
+const spanX = x, spanY = maxH + 120;
+const scale = Math.max(spanX / W, spanY / H);
+cam.left = -40; cam.right = -40 + W * scale; cam.bottom = -80; cam.top = -80 + H * scale;
+cam.position.set(0, 0, 1000);
+cam.updateProjectionMatrix();
+renderer.render(scene, cam);
+window.lineupReady = true;
+</script>
+</body>
+</html>
