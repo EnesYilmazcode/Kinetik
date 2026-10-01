@@ -1913,8 +1913,7 @@ async function generate() {
     btn.disabled = true;
     btn.textContent = 'Generating...';
     document.getElementById('welcome').classList.add('hidden');
-    document.getElementById('panel').classList.remove('collapsed');
-    document.getElementById('panel-reopen').classList.remove('visible');
+    setPanelOpen(true);
 
     const shimmer = document.createElement('div');
     shimmer.className = 'shimmer';
@@ -2016,6 +2015,7 @@ async function generate() {
         cam.active = true;
         frameCharacter(true);
         showEditor();
+        showPromptDock();
         setPill('pill-render', false);
 
         const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -3106,7 +3106,8 @@ async function handleChat(userMsg) {
     if (!userMsg.trim() || !currentClip) return;
 
     chatInput.disabled = true;
-    chatInput.placeholder = 'Processing...';
+    chatInput.placeholder = 'Working on it...';
+    syncChatSend();
     log(`> ${userMsg}`, 'user');
 
     try {
@@ -3130,27 +3131,38 @@ async function handleChat(userMsg) {
     }
 
     chatInput.disabled = false;
-    chatInput.placeholder = 'Add motion, object, or action...';
-    chatInput.focus();
+    chatInput.placeholder = CHAT_PLACEHOLDER;
+    syncChatSend();
+    if (!IS_SMALL) chatInput.focus();
 }
 
-chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-        const msg = chatInput.value.trim();
-        chatInput.value = '';
-        handleChat(msg);
-    }
-});
+const CHAT_PLACEHOLDER = chatInput.placeholder;
+const chatSend = document.getElementById('chat-send');
+function syncChatSend() { chatSend.disabled = chatInput.disabled || !chatInput.value.trim(); }
+function submitChat() {
+    const msg = chatInput.value.trim();
+    if (!msg || chatInput.disabled) return;
+    chatInput.value = '';
+    syncChatSend();
+    handleChat(msg);
+}
+chatInput.addEventListener('input', syncChatSend);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitChat(); });
+chatSend.addEventListener('click', submitChat);
+syncChatSend();
+
+function showPromptDock() {
+    document.getElementById('prompt-dock').classList.add('visible');
+    document.getElementById('render-btn').style.display = '';
+}
 
 // Panel collapse/reopen
-document.getElementById('panel-collapse').addEventListener('click', () => {
-    document.getElementById('panel').classList.add('collapsed');
-    setTimeout(() => document.getElementById('panel-reopen').classList.add('visible'), 200);
-});
-document.getElementById('panel-reopen').addEventListener('click', () => {
-    document.getElementById('panel-reopen').classList.remove('visible');
-    document.getElementById('panel').classList.remove('collapsed');
-});
+function setPanelOpen(open) {
+    document.getElementById('panel').classList.toggle('collapsed', !open);
+    document.getElementById('panel-reopen').classList.toggle('visible', !open);
+}
+document.getElementById('panel-collapse').addEventListener('click', () => setPanelOpen(false));
+document.getElementById('panel-reopen').addEventListener('click', () => setPanelOpen(true));
 
 // ?debug exposes camera state for automated checks.
 if (new URLSearchParams(location.search).has('debug')) {
@@ -3195,19 +3207,15 @@ function showEditorInfo(msg) {
 const tabActivity = document.getElementById('tab-activity');
 const tabAdd = document.getElementById('tab-add');
 const consoleEl = document.getElementById('console');
-const chatBar = document.getElementById('chat-input-bar');
 const addContent = document.getElementById('add-tab-content');
 
 function switchTab(tab) {
-    if (tab === 'activity') {
-        tabActivity.classList.add('active'); tabAdd.classList.remove('active');
-        consoleEl.style.display = ''; chatBar.style.display = '';
-        addContent.classList.remove('visible');
-    } else {
-        tabAdd.classList.add('active'); tabActivity.classList.remove('active');
-        consoleEl.style.display = 'none'; chatBar.style.display = 'none';
-        addContent.classList.add('visible');
-    }
+    const lib = tab !== 'activity';
+    tabActivity.classList.toggle('active', !lib);
+    tabAdd.classList.toggle('active', lib);
+    consoleEl.style.display = lib ? 'none' : '';
+    addContent.classList.toggle('visible', lib);
+    document.getElementById('panel').classList.toggle('tall', lib);
 }
 tabActivity.addEventListener('click', () => switchTab('activity'));
 tabAdd.addEventListener('click', () => switchTab('add'));
@@ -3219,6 +3227,8 @@ const createStatus = document.getElementById('add-create-status');
 
 const GEMINI_IMG_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_KEY}`;
 const FAL_KEY = ''; // Set your fal.ai API key here (see .env)
+// Custom models need both keys; hide the input instead of letting it fail.
+if (!FAL_KEY || !GEMINI_KEY) document.getElementById('add-create-wrap').style.display = 'none';
 
 createInput.addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
@@ -3283,40 +3293,33 @@ createInput.addEventListener('keydown', async (e) => {
 // Populate model picker with thumbnails
 const AVAILABLE_MODELS = Object.keys(MODEL_MAP);
 
-const MODEL_ICONS = {
-    tree:'🌳',pine:'🌲',bush:'🌿',rock:'🪨',building:'🏢',house:'🏠',shop:'🏪',
-    car:'🚗',truck:'🚛',street_lamp:'💡',bench:'🪑',hydrant:'🧯',trash_can:'🗑️',
-    sofa:'🛋️',bookshelf:'📚',table:'🪑',lamp:'💡',chair:'🪑',statue:'🗿',
-    fountain:'⛲',barrel:'🪣',fence_post:'🚧',mailbox:'📬',stop_sign:'🛑',
-    traffic_cone:'🔶',dumpster:'🗑️',picnic_table:'🪑',swing_set:'🎠',slide:'🛝',
-    gazebo:'⛺',bridge:'🌉',boat:'⛵',motorcycle:'🏍️',bicycle:'🚲',castle:'🏰',
-    windmill:'🌀',tent:'⛺',campfire:'🔥',log:'🪵',grave_tombstone:'🪦',
-    pumpkin:'🎃',soccer_goal:'⚽',basketball_hoop:'🏀',punching_bag:'🥊',
-    treadmill:'🏋️',piano:'🎹',bed:'🛏️',bathtub:'🛁',toilet:'🚽',
-    refrigerator:'🧊',oven:'🍳',television:'📺',computer_desk:'🖥️',
-    office_chair:'💺',filing_cabinet:'🗄️',vending_machine:'🎰',phone_booth:'📞',
-    bus_stop_shelter:'🚏',water_tower:'🗼'
-};
+// Models that ship a thumbnail in models/; the rest get a lettered tile.
+const MODEL_THUMBS = new Set(['barrel','bench','bookshelf','building','bush','car','chair','dumpster','fence_post','fountain','house','hydrant','lamp','mailbox','rock','shop','sofa','statue','stop_sign','street_lamp','table','traffic_cone','trash_can','tree','truck']);
 
 function addModelToPicker(name, thumbUrl) {
     const div = document.createElement('div');
     div.className = 'mp-item';
 
-    const img = document.createElement('img');
-    img.className = 'mp-thumb';
-    img.src = thumbUrl || `models/${name}.png`;
-    img.onerror = () => {
-        img.style.display = 'none';
-        // Show emoji icon as fallback
-        const icon = document.createElement('div');
-        icon.className = 'mp-icon';
-        icon.textContent = MODEL_ICONS[name] || '📦';
-        div.insertBefore(icon, label);
-    };
-
     const label = document.createElement('span');
     label.textContent = name.replace(/_/g, ' ');
-    div.appendChild(img);
+    const monogram = () => {
+        const icon = document.createElement('div');
+        icon.className = 'mp-icon';
+        icon.textContent = name.charAt(0);
+        return icon;
+    };
+    const src = thumbUrl || (MODEL_THUMBS.has(name) ? `models/${name}.png` : null);
+    if (src) {
+        const img = document.createElement('img');
+        img.className = 'mp-thumb';
+        img.loading = 'lazy';
+        img.alt = '';
+        img.src = src;
+        img.onerror = () => img.replaceWith(monogram());
+        div.appendChild(img);
+    } else {
+        div.appendChild(monogram());
+    }
     div.appendChild(label);
     div.addEventListener('click', () => {
         enterPlaceMode(name);
@@ -3631,6 +3634,8 @@ renderBtn.addEventListener('click', async () => {
     orbitCenter.y = 0;
 
     cam.locked = true;
+    document.body.classList.add('rendering');
+    const renderLabel = document.getElementById('render-label');
     // Save original camera state
     const origPos = camera.position.clone();
     const origTarget = controls.target.clone();
@@ -3670,6 +3675,7 @@ renderBtn.addEventListener('click', async () => {
     if (!musicAudio || musicAudio.paused) {
         const scenePrompt = timelineClips.map(c => c.prompt).join('. ') || 'ambient scene';
         renderFill.style.width = '0%';
+        renderLabel.textContent = 'Composing soundtrack';
         renderProgress.style.display = 'block';
         log('Generating soundtrack...', 'music', 'render-status');
         await generateMusic(scenePrompt);
@@ -3688,6 +3694,7 @@ renderBtn.addEventListener('click', async () => {
     }
 
     // Show progress bar
+    renderLabel.textContent = 'Recording orbit';
     renderProgress.style.display = 'block';
     renderFill.style.width = '0%';
 
@@ -3764,6 +3771,7 @@ renderBtn.addEventListener('click', async () => {
             if (musicAudio) { musicAudio.pause(); musicAudio.currentTime = 0; }
 
             renderProgress.style.display = 'none';
+            document.body.classList.remove('rendering');
             log('Render complete', 'success', 'render-status');
         }
     }
@@ -3795,7 +3803,7 @@ async function handleImportFile(e) {
 
         // Dismiss welcome if visible
         document.getElementById('welcome').classList.add('hidden');
-        document.getElementById('panel').classList.remove('collapsed');
+        setPanelOpen(true);
 
         // Rebuild scene from saved data
         const config = {
