@@ -1932,7 +1932,7 @@ async function generate() {
                 const startPt = path[0];
                 const endPt = path[path.length - 1];
                 const travelDist = Math.sqrt(
-                    (endPt[0] - startPt[0]) ** 2 + (endPt[1] - startPt[1]) ** 2
+                    (endPt[0] - startPt[0]) ** 2 + (endPt[2] - startPt[2]) ** 2
                 );
 
                 if (travelDist >= MIN_TRAVEL_DIST || attempt === MAX_RETRIES) {
