@@ -48,7 +48,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 4. **Three.js** renders everything together in the browser with a timeline editor
 
 <p align="center">
-  <img src="assets/media/demo1.png" alt="Generated scene" width="500">
+  <img src="assets/media/scene-forest-night.png" alt="Generated forest scene at night" width="700">
 </p>
 
 ## Key Features
