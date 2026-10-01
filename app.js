@@ -2873,6 +2873,12 @@ let welcomeInterval = null;
         const dt = wClock.getDelta();
         if (welcomeEl.classList.contains('hidden')) return;
         if (wMixer) wMixer.update(dt);
+        // Keep the preview in place: cancel the clip's ground travel so kicks and walks stay framed.
+        const hips = wBones && findBone(wBones, 'Hips');
+        if (hips) {
+            wGroup.position.x = -hips.position.x * wGroup.scale.x;
+            wGroup.position.z = -hips.position.z;
+        }
         wUpdateBodyMeshes();
         wRenderer.render(wScene, wCamera);
     }
