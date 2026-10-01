@@ -36,10 +36,14 @@ volume = modal.Volume.from_name("kinetik-cache", create_if_missing=True)
     secrets=[modal.Secret.from_name("kinetik-hf")],
     scaledown_window=300,
     timeout=600,
+    # Snapshot the container after the model is on the GPU, so later cold
+    # starts restore it instead of reloading 16 GB of weights.
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=4)
 class Kimodo:
-    @modal.enter()
+    @modal.enter(snap=True)
     def load(self):
         from kimodo import load_model
         from kimodo.skeleton import SOMASkeleton30
