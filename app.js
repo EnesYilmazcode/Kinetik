@@ -1373,6 +1373,14 @@ async function loadGLBModel(url, position, targetHeight, rotationY) {
     return new Promise((resolve) => {
         gltfLoader.load(url, (gltf) => {
             const model = gltf.scene;
+            // The library GLBs leave metalness at the glTF default of 1. With no environment
+            // map to reflect, full metal renders almost black, so treat them as painted surfaces.
+            model.traverse(c => {
+                if (c.isMesh && c.material && 'metalness' in c.material) {
+                    c.material.metalness = 0;
+                    c.material.roughness = Math.max(c.material.roughness, 0.75);
+                }
+            });
             // Only hide untextured meshes that are pure white or very dark (Trellis artifacts)
             // Textured meshes (with .map) should never be hidden
             model.traverse(child => {
