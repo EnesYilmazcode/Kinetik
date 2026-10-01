@@ -2844,6 +2844,7 @@ let welcomeInterval = null;
 
 // Resize
 window.addEventListener('resize', () => {
+    if (timelineClips.length) renderTimelineRuler();
     camera.aspect = viewport.clientWidth / viewport.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(viewport.clientWidth, viewport.clientHeight);
@@ -2940,6 +2941,7 @@ function showTimeline() {
     document.getElementById('timeline-bar').classList.add('visible');
 }
 
+// Clip blocks share the track in proportion to their length.
 function renderTimelineClips() {
     const container = document.getElementById('timeline-clips');
     container.innerHTML = '';
@@ -2947,26 +2949,78 @@ function renderTimelineClips() {
         const el = document.createElement('div');
         el.className = 'timeline-clip';
         if (i === selectedClipIndex) el.classList.add('selected');
-        const w = Math.max(80, seg.duration * 40);
-        el.style.width = w + 'px';
-        el.innerHTML = `<span>${seg.prompt}</span><span class="clip-dur">${seg.duration.toFixed(1)}s</span>`;
+        el.style.flex = `${seg.duration} 1 0`;
+        el.title = `${seg.prompt} (${seg.duration.toFixed(1)}s)`;
+        el.append(h('span', 'clip-name', seg.prompt), h('span', 'clip-dur', seg.duration.toFixed(1) + 's'));
         el.addEventListener('click', (e) => {
             e.stopPropagation();
-            // Toggle selection
-            if (selectedClipIndex === i) {
-                selectedClipIndex = -1;
-            } else {
-                selectedClipIndex = i;
-            }
+            if (tl.dragged) return; // that was a scrub, not a click
+            selectedClipIndex = selectedClipIndex === i ? -1 : i;
             renderTimelineClips();
-            // Seek to start of this clip
-            let t = 0;
-            for (let j = 0; j < i; j++) t += timelineClips[j].duration;
-            if (mixer) { mixer.setTime(t); updateBodyMeshes(); }
         });
         container.appendChild(el);
     });
+    tl.activeIdx = -1;
+    requestAnimationFrame(renderTimelineRuler);
 }
+
+// Time ruler with a tick spacing that fits the track width.
+function renderTimelineRuler() {
+    const ruler = document.getElementById('timeline-ruler');
+    const width = document.getElementById('timeline-clips').clientWidth;
+    tl.width = width;
+    ruler.replaceChildren();
+    if (!totalDuration || !width) return;
+    const step = [0.5, 1, 2, 5, 10, 20].find(st => (width / (totalDuration / st)) >= 90) || 30;
+    for (let t = 0; t <= totalDuration - step * 0.35; t += step) {
+        const tick = h('div', 'tl-tick', `${+t.toFixed(1)}s`);
+        tick.style.left = `${(t / totalDuration) * 100}%`;
+        ruler.append(tick);
+    }
+}
+
+// Timeline scrub state; times are clip seconds (the mixer runs them at timeScale).
+const tl = { width: 0, activeIdx: -1, dragging: false, dragged: false, wasPlaying: true, startX: 0, lastLabel: '' };
+
+function seekTimeline(t) {
+    if (!mixer || !totalDuration) return;
+    t = THREE.MathUtils.clamp(t, 0, totalDuration - 1e-3);
+    mixer.setTime(t / (mixer.timeScale || 1));
+}
+
+(() => {
+    const track = document.getElementById('timeline-track');
+    const timeAt = (e) => {
+        const r = document.getElementById('timeline-clips').getBoundingClientRect();
+        return ((e.clientX - r.left) / r.width) * totalDuration;
+    };
+    track.addEventListener('pointerdown', (e) => {
+        if (!mixer || !totalDuration) return;
+        tl.dragging = true;
+        tl.dragged = false;
+        tl.startX = e.clientX;
+        tl.wasPlaying = isPlaying;
+        isPlaying = false;
+        isScrubbing = true;
+        track.setPointerCapture(e.pointerId);
+        seekTimeline(timeAt(e));
+    });
+    track.addEventListener('pointermove', (e) => {
+        if (!tl.dragging) return;
+        if (Math.abs(e.clientX - tl.startX) > 4) tl.dragged = true;
+        seekTimeline(timeAt(e));
+    });
+    const end = () => {
+        if (!tl.dragging) return;
+        tl.dragging = false;
+        isScrubbing = false;
+        isPlaying = tl.wasPlaying;
+        setPlayIcon(isPlaying);
+        setTimeout(() => { tl.dragged = false; }, 0);
+    };
+    track.addEventListener('pointerup', end);
+    track.addEventListener('pointercancel', end);
+})();
 
 // Rebuild merged clip from all timeline segments
 function rebuildMergedClip() {
@@ -2989,29 +3043,25 @@ function updatePlayhead() {
     if (!mixer || totalDuration === 0) return;
     // Loop the merged clip
     const t = mixer.time % totalDuration;
-    const clipsEl = document.getElementById('timeline-clips');
-    const controlsEl = document.getElementById('timeline-controls');
-    // Calculate total width of just the clip blocks (not the add input)
-    let clipsWidth = 0;
-    clipsEl.querySelectorAll('.timeline-clip').forEach(el => { clipsWidth += el.offsetWidth + 4; });
-    clipsWidth = Math.max(clipsWidth, 1);
-    const offset = controlsEl.offsetWidth + 16;
-    const frac = Math.min(t / totalDuration, 1.0); // clamp to 0-1
-    const px = offset + frac * clipsWidth;
-    document.getElementById('timeline-playhead').style.left = px + 'px';
-    document.getElementById('tl-time').textContent = t.toFixed(1) + 's';
+    if (!tl.width) tl.width = document.getElementById('timeline-clips').clientWidth;
+    const frac = Math.min(t / totalDuration, 1);
+    document.getElementById('timeline-playhead').style.transform = `translateX(${(frac * tl.width).toFixed(1)}px)`;
+    const label = `${t.toFixed(1)}s`;
+    if (label !== tl.lastLabel) {
+        tl.lastLabel = label;
+        document.getElementById('tl-time').innerHTML = `${label} <span class="tl-total">/ ${totalDuration.toFixed(1)}s</span>`;
+    }
 
     // Highlight active clip
-    let elapsed = 0;
-    document.querySelectorAll('.timeline-clip').forEach((el, i) => {
-        const seg = timelineClips[i];
-        if (seg && t >= elapsed && t < elapsed + seg.duration) {
-            el.classList.add('active');
-        } else {
-            el.classList.remove('active');
-        }
-        if (seg) elapsed += seg.duration;
-    });
+    let elapsed = 0, idx = -1;
+    for (let i = 0; i < timelineClips.length; i++) {
+        if (t >= elapsed && t < elapsed + timelineClips[i].duration) { idx = i; break; }
+        elapsed += timelineClips[i].duration;
+    }
+    if (idx !== tl.activeIdx) {
+        tl.activeIdx = idx;
+        document.querySelectorAll('.timeline-clip').forEach((el, i) => el.classList.toggle('active', i === idx));
+    }
 }
 
 // Click to select/delete scene objects (silent — no panel)
@@ -3431,6 +3481,7 @@ async function handleChat(userMsg) {
     if (!IS_SMALL) chatInput.focus();
 }
 
+if (window.innerWidth < 600) chatInput.placeholder = 'What happens next?';
 const CHAT_PLACEHOLDER = chatInput.placeholder;
 const chatSend = document.getElementById('chat-send');
 function syncChatSend() { chatSend.disabled = chatInput.disabled || !chatInput.value.trim(); }
