@@ -14,35 +14,145 @@ const viewport = document.getElementById('viewport');
 
 // Three.js setup
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xd8d8d0);
+const IS_SMALL = Math.min(window.innerWidth, window.innerHeight) < 600;
 
-const camera = new THREE.PerspectiveCamera(60, viewport.clientWidth / viewport.clientHeight, 1, 10000);
+const camera = new THREE.PerspectiveCamera(50, viewport.clientWidth / viewport.clientHeight, 5, 12000);
 camera.position.set(0, 150, 400);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 viewport.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 100, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 90;
+controls.maxDistance = 2500;
+controls.maxPolarAngle = Math.PI * 0.48; // stay above the ground
 controls.update();
 
-// Grid
-const grid = new THREE.GridHelper(500, 20, 0xc0c0b8, 0xccccc4);
+// Grid (empty state only; hidden once a scene is built)
+const grid = new THREE.GridHelper(1200, 24, 0xbdb9ad, 0xcfccc2);
+grid.material.transparent = true;
+grid.material.opacity = 0.6;
 scene.add(grid);
 
-// Lights — soft key + fill + rim for nice form
-scene.add(new THREE.AmbientLight(0x303050, 1.5));
-const keyLight = new THREE.DirectionalLight(0xffffff, 2);
-keyLight.position.set(100, 200, 150);
-scene.add(keyLight);
-const fillLight = new THREE.DirectionalLight(0x8888ff, 0.8);
-fillLight.position.set(-100, 100, -50);
-scene.add(fillLight);
-const rimLight = new THREE.DirectionalLight(0xa78bfa, 1);
-rimLight.position.set(0, 50, -200);
-scene.add(rimLight);
+// ========== ENVIRONMENT: sky, fog, sun + hemisphere ==========
+// Mood presets. Colors are what you see on screen (the sky skips tone mapping).
+const ENV_PRESETS = {
+    studio: { top: '#e9e6de', horizon: '#f2f0ea', below: '#e4e1d8', sun: '#fff6ea', sunI: 2.4, sky: '#eef0f6', ground: '#b3ab98', hemiI: 1.9, fog: [900, 3200], exposure: 1.0 },
+    day:    { top: '#7fa6d6', horizon: '#e6e4da', below: '#cfcbbd', sun: '#fff1dc', sunI: 2.8, sky: '#dce7f5', ground: '#9a8e76', hemiI: 2.0, fog: [900, 3600], exposure: 1.0 },
+    dusk:   { top: '#5a6aa0', horizon: '#f1c9a2', below: '#b99a84', sun: '#ffc489', sunI: 2.6, sky: '#c8c4e0', ground: '#7d6858', hemiI: 1.6, fog: [800, 3200], exposure: 1.05 },
+    night:  { top: '#0f1729', horizon: '#34405f', below: '#20263a', sun: '#b4c6ff', sunI: 2.4, sky: '#7b8bc0', ground: '#3b3a4c', hemiI: 1.6, fog: [600, 2800], exposure: 1.25 },
+    indoor: { top: '#ddd6cb', horizon: '#eee8de', below: '#d6cfc3', sun: '#fff0dc', sunI: 2.2, sky: '#f4ede2', ground: '#9c8d79', hemiI: 2.0, fog: [900, 3000], exposure: 1.0 },
+};
+
+const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(5000, 32, 16),
+    new THREE.ShaderMaterial({
+        uniforms: {
+            top: { value: new THREE.Color() },
+            horizon: { value: new THREE.Color() },
+            below: { value: new THREE.Color() },
+        },
+        vertexShader: `varying vec3 vWorld;
+            void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz;
+            gl_Position = projectionMatrix * viewMatrix * w; }`,
+        fragmentShader: `uniform vec3 top; uniform vec3 horizon; uniform vec3 below; varying vec3 vWorld;
+            void main() { float h = normalize(vWorld - cameraPosition).y;
+            vec3 c = h > 0.0 ? mix(horizon, top, pow(min(h * 1.6, 1.0), 0.7)) : mix(horizon, below, min(-h * 6.0, 1.0));
+            gl_FragColor = vec4(c, 1.0);
+            #include <colorspace_fragment>
+            }`,
+        side: THREE.BackSide, depthWrite: false, fog: false, toneMapped: false,
+    })
+);
+sky.renderOrder = -1;
+sky.frustumCulled = false;
+scene.add(sky);
+
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x888888, 1.2);
+scene.add(hemiLight);
+
+const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+const SUN_OFFSET = new THREE.Vector3(320, 560, 260);
+sun.position.copy(SUN_OFFSET);
+sun.castShadow = true;
+sun.shadow.mapSize.set(IS_SMALL ? 1024 : 2048, IS_SMALL ? 1024 : 2048);
+Object.assign(sun.shadow.camera, { left: -520, right: 520, top: 520, bottom: -520, near: 50, far: 2000 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.8;
+scene.add(sun, sun.target);
+
+// Soft contact shadow under the character, so feet read as grounded
+// even where the shadow map is coarse.
+const contactShadow = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(0,0,0,0.55)');
+    grad.addColorStop(0.5, 'rgba(0,0,0,0.22)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    const m = new THREE.Mesh(
+        new THREE.PlaneGeometry(90, 90),
+        new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false, opacity: 0.6 })
+    );
+    m.rotation.x = -Math.PI / 2;
+    m.position.y = 0.6;
+    m.renderOrder = 1;
+    m.visible = false;
+    scene.add(m);
+    return m;
+})();
+
+let envName = 'studio';
+function applyEnvironment(name) {
+    const p = ENV_PRESETS[name] || ENV_PRESETS.day;
+    envName = name;
+    sky.material.uniforms.top.value.set(p.top);
+    sky.material.uniforms.horizon.value.set(p.horizon);
+    sky.material.uniforms.below.value.set(p.below);
+    scene.fog = new THREE.Fog(p.horizon, p.fog[0], p.fog[1]);
+    sun.color.set(p.sun);
+    sun.intensity = p.sunI;
+    hemiLight.color.set(p.sky);
+    hemiLight.groundColor.set(p.ground);
+    hemiLight.intensity = p.hemiI;
+    renderer.toneMappingExposure = p.exposure;
+}
+applyEnvironment('studio');
+
+// Pick a mood from the prompt and scene type.
+function environmentFor(prompt, sceneType) {
+    const p = (prompt || '').toLowerCase();
+    if (/\b(night|midnight|spooky|haunted|graveyard|cemetery|moon|moonlit|dark)\b/.test(p)) return 'night';
+    if (/\b(sunset|sunrise|dusk|dawn|evening|golden hour)\b/.test(p)) return 'dusk';
+    if (sceneType === 'indoor') return 'indoor';
+    return 'day';
+}
+
+// Every mesh under obj casts and receives shadows.
+function enableShadows(obj) {
+    obj.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+}
+
+// The BVH root bone stays at the origin; Hips carries the actual travel.
+let _hipsBone = null, _hipsRoot = null;
+function characterAnchor(out) {
+    if (!currentBones) return null;
+    if (_hipsRoot !== currentBones) { _hipsRoot = currentBones; _hipsBone = findBone(currentBones, 'Hips') || currentBones; }
+    return _hipsBone.getWorldPosition(out);
+}
 
 let mixer = null;
 let currentBones = null;
@@ -528,7 +638,7 @@ function createTexturedGround(size, baseColor) {
     }
 
     // Add subtle grid lines for spatial reference
-    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.15)`;
+    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.08)`;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 512; i += 64) {
         ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 512); ctx.stroke();
@@ -536,6 +646,8 @@ function createTexturedGround(size, baseColor) {
     }
 
     const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = 4;
     texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
     texture.repeat.set(size / 200, size / 200);
 
@@ -543,6 +655,7 @@ function createTexturedGround(size, baseColor) {
     const mat = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.92 });
     const plane = new THREE.Mesh(geo, mat);
     plane.rotation.x = -Math.PI / 2;
+    plane.receiveShadow = true;
     return plane;
 }
 
@@ -668,6 +781,7 @@ function extendEnvironmentAlongPath(newPath) {
             if (proc) {
                 proc.position.set(fx, 0, fz);
                 proc.rotation.y = Math.random() * Math.PI * 2;
+                enableShadows(proc);
                 scene.add(proc);
                 sceneObjects.push(proc);
                 added++;
@@ -1275,6 +1389,7 @@ async function loadGLBModel(url, position, targetHeight, rotationY) {
             const scaledBox = new THREE.Box3().setFromObject(model);
             model.position.set(position[0], position[1] - scaledBox.min.y, position[2]);
             if (rotationY) model.rotation.y = rotationY;
+            enableShadows(model);
             scene.add(model);
             sceneObjects.push(model);
             resolve(model);
@@ -1589,18 +1704,13 @@ async function buildScene(config) {
     // Ground created after layout so we know the world extent
     const groundBase = (config.scene.ground && config.scene.ground.color) || '#888877';
 
-    // Lights
+    // Lights: the sun and sky light come from the environment preset.
+    // Only Gemini's point lights (campfires, lamps) are added on top.
     for (const light of (config.scene.lights || [])) {
         let l;
         const color = light.color || '#ffffff';
         const intensity = light.intensity || 1;
-        if (light.type === 'ambient') {
-            l = new THREE.AmbientLight(color, intensity);
-        } else if (light.type === 'directional') {
-            l = new THREE.DirectionalLight(color, intensity);
-            const p = light.position || [100, 200, 100];
-            l.position.set(p[0], p[1], p[2]);
-        } else if (light.type === 'point') {
+        if (light.type === 'point') {
             l = new THREE.PointLight(color, intensity, 2000);
             const p = light.position || [0, 200, 0];
             l.position.set(p[0], p[1], p[2]);
@@ -1608,8 +1718,7 @@ async function buildScene(config) {
         if (l) { scene.add(l); sceneObjects.push(l); }
     }
 
-    scene.fog = null;
-    scene.background = new THREE.Color(0xd8d8d0);
+    applyEnvironment(environmentFor(config._prompt, config.scene.type));
 
     // Layout engine: Gemini picks objects, code positions them
     const charPath = config._characterPath || [[0, 0]];
@@ -1633,6 +1742,19 @@ async function buildScene(config) {
     groundMesh.userData._isGround = true;
     scene.add(groundMesh);
     sceneObjects.push(groundMesh);
+
+    // A wide untextured skirt in the same color runs out to the fog,
+    // so the ground has no visible edge against the sky.
+    const skirt = new THREE.Mesh(
+        new THREE.CircleGeometry(6000, 48),
+        new THREE.MeshStandardMaterial({ color: groundBase, roughness: 0.95 })
+    );
+    skirt.rotation.x = -Math.PI / 2;
+    skirt.position.y = -1.5;
+    skirt.receiveShadow = true;
+    skirt.userData._isGround = true;
+    scene.add(skirt);
+    sceneObjects.push(skirt);
 
     // Place loading placeholders at computed positions BEFORE loading models
     const placeholders = [];
@@ -1681,6 +1803,7 @@ async function buildScene(config) {
             if (m.rotationY) procedural.rotation.y = m.rotationY;
             procedural.userData._keyword = m.keyword;
             if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
+            enableShadows(procedural);
             scene.add(procedural);
             sceneObjects.push(procedural);
             if (!isFill) {
@@ -1848,6 +1971,7 @@ async function generate() {
 
         const config = await callGemini(prompt, characterPath);
         config._characterPath = characterPath;
+        config._prompt = prompt;
         const geminiElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         const modelCount = (config.scene.models || []).length;
         log(`Planned ${modelCount} models (${geminiElapsed}s)`, 'scene');
@@ -1860,6 +1984,7 @@ async function generate() {
         setPill('pill-render', true);
         log('Loading animation...', 'render');
         await loadBVH(bvhText);
+        prepareCharacter();
         lastBvhText = bvhText;
 
         // Build path visualization and apply terrain
@@ -1974,7 +2099,33 @@ function animate() {
         const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
         selectionBox.material.opacity = pulse;
     }
+    updateEnvironmentFollow();
     renderer.render(scene, camera);
+}
+
+// Sun, shadow frustum, sky and contact shadow track the character.
+const _envFocus = new THREE.Vector3();
+function updateEnvironmentFollow() {
+    if (characterAnchor(_envFocus)) {
+        contactShadow.position.x = _envFocus.x;
+        contactShadow.position.z = _envFocus.z;
+        // Fade the blob as the hips rise (jumps, flips)
+        const lift = Math.max(0, _envFocus.y - 95);
+        contactShadow.material.opacity = 0.6 * Math.max(0.25, 1 - lift / 120);
+    } else {
+        _envFocus.copy(controls.target);
+    }
+    _envFocus.y = 0;
+    sun.target.position.copy(_envFocus);
+    sun.position.copy(_envFocus).add(SUN_OFFSET);
+    sky.position.copy(camera.position);
+}
+
+// Shadows on whatever character meshes exist after a BVH load.
+function prepareCharacter() {
+    if (characterGroup) enableShadows(characterGroup);
+    bodyMeshes.forEach(m => { m.castShadow = true; m.receiveShadow = true; });
+    contactShadow.visible = !!currentBones;
 }
 animate();
 
@@ -2659,6 +2810,7 @@ async function handleAddObject(params) {
     if (procedural) {
         procedural.position.set(x, 0, z);
         procedural.userData._keyword = params.keyword;
+        enableShadows(procedural);
         scene.add(procedural);
         sceneObjects.push(procedural);
         log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
@@ -3521,6 +3673,7 @@ async function handleImportFile(e) {
         // Load BVH animation
         if (data.bvh) {
             await loadBVH(data.bvh);
+            prepareCharacter();
             lastBvhText = data.bvh;
 
             // Rebuild timeline
