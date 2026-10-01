@@ -3,7 +3,9 @@ import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-const API = 'https://c8sh4j1k8nkzp9-8000.proxy.runpod.net';
+// Kimodo motion server on Modal (scripts/modal_app.py). Override with ?api=<url>.
+const API = new URLSearchParams(location.search).get('api')
+    || 'https://enesyilmaz5157--kinetik-kimodo-web.modal.run';
 const GEMINI_KEY = ''; // Set your Gemini API key here (see .env)
 if (!GEMINI_KEY) console.warn('GEMINI_KEY not set — scene generation will not work (see .env)');
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
@@ -1917,7 +1919,7 @@ async function generate() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ prompt: motionPrompt, duration })
             });
-            if (!motionRes.ok) throw new Error((await motionRes.json()).error || 'Motion failed');
+            if (!motionRes.ok) throw new Error(await motionError(motionRes));
             bvhText = await motionRes.text();
 
             const motionElapsed = ((Date.now() - motionStart) / 1000).toFixed(1);
@@ -2085,6 +2087,14 @@ animate();
 log('Kinetik v0.1', 'system');
 log('Kimodo model loaded on RunPod GPU', 'success');
 log('Type a prompt or pick a scene to start', 'system');
+
+async function motionError(res) {
+    try {
+        const { detail } = await res.json();
+        if (typeof detail === 'string') return detail;
+    } catch {}
+    return `Motion failed (${res.status})`;
+}
 
 // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
 const WELCOME_MOTIONS = [
@@ -2775,7 +2785,7 @@ async function handleAddMotion(params) {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ prompt: enhanceMotionPrompt(params.prompt), duration: dur })
         });
-        if (!res.ok) throw new Error('Motion generation failed');
+        if (!res.ok) throw new Error(await motionError(res));
         const bvh = await res.text();
 
         let newClip;
