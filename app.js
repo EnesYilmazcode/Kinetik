@@ -1712,8 +1712,11 @@ async function buildScene(config) {
     grid.visible = false;
     Object.keys(modelCache).forEach(k => delete modelCache[k]);
 
-    // Ground created after layout so we know the world extent
-    const groundBase = (config.scene.ground && config.scene.ground.color) || '#888877';
+    // Ground created after layout so we know the world extent.
+    // Gemini's color, lifted a little toward a warm gray so asphalt and soil
+    // read as surfaces instead of holes under tone mapping.
+    const groundBase = '#' + new THREE.Color((config.scene.ground && config.scene.ground.color) || '#888877')
+        .lerp(new THREE.Color('#d9d4c7'), 0.22).getHexString();
 
     // Lights: the sun and sky light come from the environment preset.
     // Only Gemini's point lights (campfires, lamps) are added on top.
@@ -2355,6 +2358,7 @@ const cam = {
     boxes: [], boxStamp: -1, boxTime: 0,
     fading: new Set(),
     tween: null,
+    vel: new THREE.Vector3(), prevHips: null,
 };
 const _camFocus = new THREE.Vector3(), _camStep = new THREE.Vector3();
 const _segRay = new THREE.Ray(), _segHit = new THREE.Vector3(), _segDir = new THREE.Vector3();
@@ -2489,7 +2493,16 @@ function frameCharacter(animateIt = true) {
 function updateCamera(dt) {
     const hasChar = cam.active && !cam.locked && characterAnchor(_camFocus);
     if (hasChar) {
-        const ty = THREE.MathUtils.clamp(_camFocus.y * 0.92, 50, 140);
+        // Lead by the smoothed ground velocity so a fast walker stays centered.
+        if (cam.prevHips && dt > 0) {
+            _camStep.subVectors(_camFocus, cam.prevHips).divideScalar(dt);
+            _camStep.y = 0;
+            if (_camStep.lengthSq() > 1500 * 1500) cam.vel.set(0, 0, 0); // loop jump
+            else cam.vel.lerp(_camStep, 1 - Math.exp(-dt * 2));
+        }
+        cam.prevHips = (cam.prevHips || new THREE.Vector3()).copy(_camFocus);
+        _camFocus.addScaledVector(cam.vel, 0.2);
+        const ty = THREE.MathUtils.clamp(cam.prevHips.y * 0.92, 50, 140);
         cam.focusY += (ty - cam.focusY) * (1 - Math.exp(-dt * 1.5));
         _camFocus.y = cam.focusY;
     }
