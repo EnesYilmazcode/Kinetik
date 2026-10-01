@@ -2085,7 +2085,6 @@ animate();
 
 // Initial welcome messages
 log('Kinetik v0.1', 'system');
-log('Kimodo model loaded on RunPod GPU', 'success');
 log('Type a prompt or pick a scene to start', 'system');
 
 async function motionError(res) {
@@ -2095,6 +2094,18 @@ async function motionError(res) {
     } catch {}
     return `Motion failed (${res.status})`;
 }
+
+// Report what the motion server actually says instead of assuming it is up.
+// This also warms a GPU container while the user is still typing.
+(async () => {
+    try {
+        const res = await fetch(`${API}/health`);
+        const h = await res.json();
+        log(`Motion model ready: ${h.model} on Modal ${h.gpu}`, 'success');
+    } catch {
+        log('Motion server unreachable, generation will fail', 'error');
+    }
+})();
 
 // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
 const WELCOME_MOTIONS = [
