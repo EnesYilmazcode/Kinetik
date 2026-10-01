@@ -3,6 +3,8 @@ import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createCharacter } from './character.js';
+import { ASSETS, vegetationFor, realHeight, settingFor, makePathFrame, rng, layoutAlongRoute,
+    makeVegetation, makeFill, makeGroundCover, makeTrail, groundTexture } from './world.js';
 
 // Kimodo motion server on Modal (scripts/modal_app.py). Override with ?api=<url>.
 const API = new URLSearchParams(location.search).get('api')
@@ -551,7 +553,7 @@ const SCENE_SYSTEM_PROMPT = `You are a creative 3D scene designer. Given a user 
 You do NOT need to specify positions — the engine handles placement automatically. Just pick the right objects.
 
 JSON structure:
-{"scene":{"type":"outdoor"|"indoor","models":[{"keyword":"search term","category":number,"size":"large"|"medium"|"small"}],"ground":{"color":"#hex"},"lights":[{"type":"ambient"|"directional"|"point","intensity":0-3,"color":"#hex","position":[x,y,z]}]},"motion_prompt":"A person ..."}
+{"scene":{"type":"outdoor"|"indoor","setting":"park"|"forest"|"urban"|"beach"|"desert"|"snow"|"indoor"|"plain","models":[{"keyword":"search term","category":number,"size":"large"|"medium"|"small"}],"ground":{"color":"#hex"},"lights":[{"type":"ambient"|"directional"|"point","intensity":0-3,"color":"#hex","position":[x,y,z]}]},"motion_prompt":"A person ..."}
 
 POLY PIZZA CATEGORIES: 0=Food, 1=Clutter, 3=Transport, 4=Furniture, 5=Objects, 6=Nature, 7=Animals, 8=Buildings, 11=Other
 
@@ -565,13 +567,15 @@ Think carefully. Every object must make sense for the specific scene.
 
 BANNED KEYWORDS (NEVER use): "fence", "gate", "wall", "barrier", "shelter", "bus stop", "bus shelter", "canopy", "awning", "stop sign", "road barrier", "barricade"
 
-SIZE GUIDE:
-- "large": buildings, houses, large trees, skyscrapers (background structures)
-- "medium": cars, street lamps, small trees, sofas, bookshelves (mid-sized objects)
-- "small": bench, chair, hydrant, trash can, flower, cone, barrel, crate (small props)
+SIZE GUIDE (only a hint; the engine scales every object to its real-world size):
+- "large": buildings, houses, large trees (background structures)
+- "medium": cars, street lamps, statues, fountains, sofas, bookshelves
+- "small": bench, chair, hydrant, trash can, cone, barrel, crate
+
+SETTING: the kind of place. The engine adds matching scenery (trees, grass, a trail or sidewalk) along the character's route, so do not list generic filler like many trees or rocks.
 
 RULES:
-- 6-8 models. Mix: 2-3 large + 2-3 medium + 2-3 small
+- 6-10 models. Mix: 2-3 large + 3-4 medium + 2-3 small. Pick things that would sit beside a path through this place
 - Each keyword must be UNIQUE — no repeats
 - Be CREATIVE with keywords! Don't use the same objects every time. Examples:
   Buildings: apartment, church, castle, tower, warehouse, factory, hotel, restaurant, bakery, cinema, museum, cottage, cabin
@@ -618,48 +622,9 @@ let pathLine = null;
 let pathVisible = false;
 
 // ========== PROCEDURAL GROUND TEXTURE ==========
-function createTexturedGround(size, baseColor) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 512; canvas.height = 512;
-    const ctx = canvas.getContext('2d');
-
-    // Parse base color
-    const tmp = new THREE.Color(baseColor);
-    const r = Math.floor(tmp.r * 255), g = Math.floor(tmp.g * 255), b = Math.floor(tmp.b * 255);
-
-    // Fill base
-    ctx.fillStyle = baseColor;
-    ctx.fillRect(0, 0, 512, 512);
-
-    // Add noise variation — multiple passes for organic feel
-    for (let pass = 0; pass < 3; pass++) {
-        const blockSize = [16, 8, 4][pass];
-        const strength = [25, 15, 8][pass];
-        for (let y = 0; y < 512; y += blockSize) {
-            for (let x = 0; x < 512; x += blockSize) {
-                const vary = (Math.random() - 0.5) * strength;
-                const nr = Math.min(255, Math.max(0, r + vary));
-                const ng = Math.min(255, Math.max(0, g + vary * 0.9));
-                const nb = Math.min(255, Math.max(0, b + vary * 0.7));
-                ctx.fillStyle = `rgba(${nr|0},${ng|0},${nb|0},${[0.6, 0.4, 0.3][pass]})`;
-                ctx.fillRect(x, y, blockSize, blockSize);
-            }
-        }
-    }
-
-    // Add subtle grid lines for spatial reference
-    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.08)`;
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 512; i += 64) {
-        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 512); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(512, i); ctx.stroke();
-    }
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    texture.anisotropy = 4;
-    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-    texture.repeat.set(size / 200, size / 200);
+function createTexturedGround(size, baseColor, setting) {
+    const texture = groundTexture(setting, baseColor);
+    texture.repeat.set(size / 400, size / 400);
 
     const geo = new THREE.PlaneGeometry(size, size, 64, 64); // 64x64 subdivisions for terrain
     const mat = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.92 });
@@ -687,6 +652,8 @@ function applyTerrainFromPath(terrainMesh, pathPoints) {
     // Check if there's a sustained trend (not just bouncing)
     const maxSmoothedDelta = Math.max(...smoothedY.map(y => Math.abs(y - baseY)));
     if (maxSmoothedDelta < 3) return; // No meaningful elevation
+    if (Math.abs(smoothedY[smoothedY.length - 1] - baseY) < 25) return; // ends where it started (jump, flip)
+    terrainMesh.userData._terrain = true;
 
     const posAttr = terrainMesh.geometry.getAttribute('position');
 
@@ -1269,6 +1236,8 @@ const PROCEDURAL_KEYWORDS = {
 };
 
 function tryProceduralModel(keyword, height) {
+    const veg = vegetationFor(keyword);
+    if (veg) return makeVegetation(veg.kind, height, world?.setting);
     const kw = keyword.toLowerCase();
     for (const [key, builder] of Object.entries(PROCEDURAL_KEYWORDS)) {
         if (kw.includes(key)) return builder(height);
@@ -1342,7 +1311,7 @@ const MODEL_MAP = {
     'bus_stop_shelter': ['bus stop','bus shelter','transit stop'],
     'water_tower': ['water tower','tower tank'],
     'satellite_dish': ['satellite dish','dish','antenna','satellite'],
-    'crane': ['crane','construction crane','tower crane'],
+    'crane': ['crane bird','heron','stork'],
     'forklift': ['forklift','lift truck','pallet jack'],
     'shopping_cart': ['shopping cart','cart','trolley'],
     'streetlight': ['streetlight','street light','lamp post'],
@@ -1370,9 +1339,32 @@ async function findLocalModel(keyword, category) {
     const kw = keyword.toLowerCase().trim();
     // Exact match
     if (KEYWORD_TO_FILE[kw]) return KEYWORD_TO_FILE[kw];
-    // Partial match — check if any mapped keyword is contained in the request
-    for (const [mapped, file] of Object.entries(KEYWORD_TO_FILE)) {
-        if (kw.includes(mapped) || mapped.includes(kw)) return file;
+    return partialModelMatch(kw);
+}
+
+function visibleBox(model) {
+    model.updateMatrixWorld(true);
+    const box = new THREE.Box3();
+    model.traverse(c => { if (c.isMesh && c.visible) box.expandByObject(c); });
+    return box.isEmpty() ? box.setFromObject(model) : box;
+}
+
+// Library file name for a keyword ('park bench' -> 'bench'), or null.
+function libraryFile(keyword) {
+    const kw = keyword.toLowerCase().trim();
+    const url = KEYWORD_TO_FILE[kw] || partialModelMatch(kw);
+    return url ? url.slice('models/'.length, -'.glb'.length) : null;
+}
+
+// Whole-word match in either direction ('wooden bench' -> bench), longest name first,
+// so 'flower bed' does not become a bed and 'street sign' does not become a tree.
+const _byLength = Object.keys(KEYWORD_TO_FILE).sort((a, b) => b.length - a.length);
+function partialModelMatch(kw) {
+    const words = s => ` ${s.replace(/[^a-z0-9]+/g, ' ').trim()} `;
+    const k = words(kw);
+    for (const mapped of _byLength) {
+        const m = words(mapped);
+        if (k.includes(m) || (k.trim().length > 3 && m.includes(k))) return KEYWORD_TO_FILE[mapped];
     }
     return null;
 }
@@ -1391,12 +1383,11 @@ async function loadGLBModel(url, position, targetHeight, rotationY) {
                     if (c.r < 0.08 && c.g < 0.08 && c.b < 0.08) child.visible = false;
                 }
             });
-            const box = new THREE.Box3().setFromObject(model);
             const size = new THREE.Vector3();
-            box.getSize(size);
+            visibleBox(model).getSize(size);
             const s = targetHeight / (size.y || 1);
             model.scale.setScalar(s);
-            const scaledBox = new THREE.Box3().setFromObject(model);
+            const scaledBox = visibleBox(model);
             model.position.set(position[0], position[1] - scaledBox.min.y, position[2]);
             if (rotationY) model.rotation.y = rotationY;
             enableShadows(model);
@@ -1705,6 +1696,72 @@ function computeLayout(models, sceneType, charPath) {
     return placed;
 }
 
+let world = null; // outdoor scene state: { frame, setting, rand, s1, spots, trail }
+
+function hashString(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+    return h >>> 0;
+}
+
+// Ground height under (x, z): flat unless a climb reshaped the terrain.
+function groundY(x, z) {
+    if (!groundMesh || !groundMesh.userData._terrain) return 0;
+    const { width, height, widthSegments: nx, heightSegments: ny } = groundMesh.geometry.parameters;
+    const fx = THREE.MathUtils.clamp((x + width / 2) / width * nx, 0, nx - 1e-6);
+    const fy = THREE.MathUtils.clamp((height / 2 + z) / height * ny, 0, ny - 1e-6);
+    const c = Math.floor(fx), r = Math.floor(fy), u = fx - c, v = fy - r;
+    const pos = groundMesh.geometry.getAttribute('position');
+    const at = (rr, cc) => pos.getZ(rr * (nx + 1) + cc);
+    return (at(r, c) * (1 - u) + at(r, c + 1) * u) * (1 - v) + (at(r + 1, c) * (1 - u) + at(r + 1, c + 1) * u) * v;
+}
+
+// Scenery between route positions s0 and s1. Near trees stay separate objects
+// so the camera can fade them; far ones, grass and flowers count as ground.
+function populateWorld(frame, s0, s1, avoid) {
+    const fill = makeFill(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid });
+    for (const o of fill.near) {
+        o.userData._keyword = o.userData._veg;
+        enableShadows(o);
+        scene.add(o);
+        sceneObjects.push(o);
+    }
+    for (const g of [fill.far, makeGroundCover(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid: fill.spots })]) {
+        if (!g.children.length) continue;
+        g.userData._isGround = true;
+        scene.add(g);
+        sceneObjects.push(g);
+    }
+    return fill.spots;
+}
+
+function layTrail() {
+    if (world.trail) {
+        scene.remove(world.trail);
+        sceneObjects = sceneObjects.filter(o => o !== world.trail);
+        world.trail.geometry.dispose();
+    }
+    world.trail = makeTrail(world.frame, world.setting, -900, world.frame.length + 1500, groundY);
+    if (world.trail) {
+        world.trail.userData._isGround = true;
+        scene.add(world.trail);
+        sceneObjects.push(world.trail);
+    }
+}
+
+// A new clip moved the character further: grow the scenery to cover it.
+function extendWorld(fullPath) {
+    if (!world) return;
+    const frame = makePathFrame(fullPath);
+    const s1 = frame.length + 1500;
+    world.frame = frame;
+    if (s1 > world.s1 + 100) {
+        world.spots.push(...populateWorld(frame, world.s1, s1, world.spots));
+        world.s1 = s1;
+    }
+    layTrail();
+}
+
 async function buildScene(config) {
     clearFades();
     sceneObjects.forEach(obj => scene.remove(obj));
@@ -1734,25 +1791,23 @@ async function buildScene(config) {
 
     applyEnvironment(environmentFor(config._prompt, config.scene.type));
 
-    // Layout engine: Gemini picks objects, code positions them
+    // Gemini picks the objects; the engine sizes them for real and lays them along the route.
     const charPath = config._characterPath || [[0, 0]];
     const sceneType = config.scene.type || 'outdoor';
-    const rawModels = config.scene.models || [];
-    const placedModels = computeLayout(rawModels, sceneType, charPath);
+    const setting = settingFor(config._prompt, config.scene.setting, sceneType);
+    const rand = rng(hashString(config._prompt || 'scene'));
+    const frame = makePathFrame(charPath);
+    const rawModels = (config.scene.models || []).filter(m => !BANNED.some(b => m.keyword.toLowerCase().includes(b)));
+    const placedModels = setting === 'indoor'
+        ? computeLayout(rawModels, 'indoor', charPath).map(m => ({ ...m, scale: realHeight(m.keyword, libraryFile(m.keyword), m.size) }))
+        : layoutAlongRoute(rawModels, { frame, setting, resolveFile: libraryFile, rand });
+    world = setting === 'indoor' ? null : { frame, setting, rand, s1: frame.length + 1500, spots: [], trail: null };
 
-    // Size ground to match the furthest object + small margin
-    let maxExtent = 200; // minimum
-    for (const m of placedModels) {
-        const dist = Math.sqrt(m.position[0] ** 2 + m.position[2] ** 2) + (m.scale || 50);
-        if (dist > maxExtent) maxExtent = dist;
-    }
-    // Also include character path
-    for (const [px, , pz] of charPath) {
-        const dist = Math.sqrt(px * px + (pz || 0) * (pz || 0)) + 100;
-        if (dist > maxExtent) maxExtent = dist;
-    }
-    const groundSize = maxExtent * 2 + 100; // diameter + margin
-    groundMesh = createTexturedGround(groundSize, groundBase);
+    // The ground covers the route with a wide margin.
+    let reach = 1200;
+    for (const [px, , pz] of charPath) reach = Math.max(reach, Math.hypot(px, pz || 0) + 2600);
+    const groundSize = reach * 2;
+    groundMesh = createTexturedGround(groundSize, groundBase, setting);
     groundMesh.userData._isGround = true;
     scene.add(groundMesh);
     sceneObjects.push(groundMesh);
@@ -1857,6 +1912,13 @@ async function buildScene(config) {
         ...fillModels.map(m => loadModel(m, -1))
     ];
     await Promise.all(loadPromises);
+
+    // Scenery, grass and a trail along the whole route and past both ends.
+    if (world) {
+        const discs = placedModels.map(m => [m.position[0], m.position[2], m.footprint || 60]);
+        world.spots = populateWorld(frame, -900, world.s1, discs);
+        layTrail();
+    }
 
     log(`${loadedCount} of ${totalMain} models placed`, 'scene', 'model-progress');
 
@@ -2565,22 +2627,7 @@ function animate() {
     updateCamera(Math.min(dt, 0.1));
     if (!skinnedCharMesh) updateBodyMeshes(); // capsule fallback only
     if (timelineClips.length > 0) updatePlayhead();
-    // Keep ground centered on character
-    if (currentBones && characterGroup) {
-        currentBones.getWorldPosition(_charWorldPos);
-        if (groundMesh) {
-            groundMesh.position.x = _charWorldPos.x;
-            groundMesh.position.z = _charWorldPos.z;
-        }
-        // Extend environment when character goes far from last extension point
-        if (!window._lastExtendPos) window._lastExtendPos = new THREE.Vector3();
-        const distFromLastExtend = _charWorldPos.distanceTo(window._lastExtendPos);
-        if (distFromLastExtend > 200) {
-            window._lastExtendPos.copy(_charWorldPos);
-            const nearby = [[_charWorldPos.x, 0, _charWorldPos.z]];
-            extendEnvironmentAlongPath(nearby);
-        }
-    }
+    if (currentBones) characterAnchor(_charWorldPos);
     // Pulse selection box
     if (selectionBox) {
         const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
@@ -3486,6 +3533,7 @@ async function handleAddMotion(params) {
         updatePathVisualization(fullPath);
         // Update terrain for the new extended path
         if (groundMesh) applyTerrainFromPath(groundMesh, fullPath);
+        extendWorld(fullPath);
 
         log(`Added motion: "${params.prompt}" (${newClip.duration.toFixed(1)}s)`, 'success', 'chat-action');
         run?.done('blend', `Clip ${timelineClips.length} added, ${newClip.duration.toFixed(1)} s`);
