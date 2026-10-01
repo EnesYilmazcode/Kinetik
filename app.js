@@ -1696,6 +1696,7 @@ function computeLayout(models, sceneType, charPath) {
 }
 
 async function buildScene(config) {
+    clearFades();
     sceneObjects.forEach(obj => scene.remove(obj));
     sceneObjects = [];
     grid.visible = false;
@@ -1743,11 +1744,17 @@ async function buildScene(config) {
     scene.add(groundMesh);
     sceneObjects.push(groundMesh);
 
-    // A wide untextured skirt in the same color runs out to the fog,
-    // so the ground has no visible edge against the sky.
+    // A wide ring with the same texture runs from under the ground's edge out
+    // to the fog, so the ground has no visible edge against the sky.
+    const SKIRT_R = 6000;
+    const skirtMap = groundMesh.material.map.clone();
+    skirtMap.repeat.set(SKIRT_R / 100, SKIRT_R / 100);
+    const phase = (groundSize / 2 - SKIRT_R) / 200; // line the texture up with the ground's
+    skirtMap.offset.set(phase, phase);
+    skirtMap.needsUpdate = true;
     const skirt = new THREE.Mesh(
-        new THREE.CircleGeometry(6000, 48),
-        new THREE.MeshStandardMaterial({ color: groundBase, roughness: 0.95 })
+        new THREE.RingGeometry(groundSize * 0.42, SKIRT_R, 96, 1),
+        new THREE.MeshStandardMaterial({ map: skirtMap, roughness: 0.92 })
     );
     skirt.rotation.x = -Math.PI / 2;
     skirt.position.y = -1.5;
@@ -2006,6 +2013,8 @@ async function generate() {
         isPlaying = true;
 
         log('Scene complete', 'render');
+        cam.active = true;
+        frameCharacter(true);
         showEditor();
         setPill('pill-render', false);
 
@@ -2065,10 +2074,190 @@ welcomeInputEl.addEventListener('keydown', (e) => {
 
 // Render loop
 const _charWorldPos = new THREE.Vector3();
-let _userOrbiting = false;
-let _orbitTimeout = null;
-controls.addEventListener('start', () => { _userOrbiting = true; clearTimeout(_orbitTimeout); });
-controls.addEventListener('end', () => { _orbitTimeout = setTimeout(() => { _userOrbiting = false; }, 2000); });
+
+// ========== CAMERA: frame the character, follow it, see past models ==========
+const cam = {
+    active: false,     // follow once a character exists
+    locked: false,     // render capture drives the camera itself
+    interacting: false,
+    userMoved: false,
+    focusY: 95,
+    lastCheck: 0,
+    boxes: [], boxStamp: -1, boxTime: 0,
+    fading: new Set(),
+    tween: null,
+};
+const _camFocus = new THREE.Vector3(), _camStep = new THREE.Vector3();
+const _segRay = new THREE.Ray(), _segHit = new THREE.Vector3(), _segDir = new THREE.Vector3();
+const FADED_OPACITY = 0.16;
+
+controls.addEventListener('start', () => {
+    cam.interacting = true;
+    cam.userMoved = true;
+    cam.tween = null;
+});
+controls.addEventListener('end', () => { cam.interacting = false; });
+
+// World boxes of placed models, refreshed when the scene changes.
+function modelBoxes() {
+    const now = performance.now();
+    if (cam.boxStamp !== sceneObjects.length || now - cam.boxTime > 2000) {
+        cam.boxes = [];
+        for (const o of sceneObjects) {
+            if (o.userData._isGround || o.isLight || !o.visible) continue;
+            const box = new THREE.Box3().setFromObject(o);
+            if (!box.isEmpty()) cam.boxes.push({ obj: o, box });
+        }
+        cam.boxStamp = sceneObjects.length;
+        cam.boxTime = now;
+    }
+    return cam.boxes;
+}
+
+// Models that sit between the camera and the character's head, hips or feet,
+// or that the camera is inside.
+function blockersBetween(camPos, focus) {
+    const pts = [
+        focus,
+        new THREE.Vector3(focus.x, 15, focus.z),
+        new THREE.Vector3(focus.x, focus.y + 75, focus.z),
+    ];
+    const out = [];
+    for (const { obj, box } of modelBoxes()) {
+        if (obj === selectedObject) continue;
+        if (box.distanceToPoint(camPos) < 60) { out.push(obj); continue; } // in front of the lens
+        for (const p of pts) {
+            if (box.containsPoint(p)) continue; // character is inside this box (under a canopy)
+            const len = camPos.distanceTo(p);
+            _segRay.set(camPos, _segDir.subVectors(p, camPos).normalize());
+            if (_segRay.intersectBox(box, _segHit) && camPos.distanceTo(_segHit) < len - 20) { out.push(obj); break; }
+        }
+    }
+    return out;
+}
+
+function setFaded(obj, faded) {
+    if (!!obj.userData._fadeTarget === faded && (faded || !cam.fading.has(obj))) return;
+    obj.userData._fadeTarget = faded;
+    obj.traverse(c => {
+        if (!c.isMesh || Array.isArray(c.material)) return;
+        if (!c.userData._fadeMat) {
+            c.userData._origMat = c.material;
+            const m = c.material.clone();
+            m.transparent = true;
+            m.opacity = 1;
+            c.userData._fadeMat = m;
+        }
+        c.material = c.userData._fadeMat;
+    });
+    cam.fading.add(obj);
+}
+
+// Ease faded models toward their target opacity, restoring the original
+// material once a model is fully visible again.
+function updateFades(dt) {
+    const k = 1 - Math.exp(-dt * 8);
+    for (const obj of cam.fading) {
+        const target = obj.userData._fadeTarget ? FADED_OPACITY : 1;
+        let done = true;
+        obj.traverse(c => {
+            const m = c.userData && c.userData._fadeMat;
+            if (!m || c.material !== m) return;
+            m.opacity += (target - m.opacity) * k;
+            if (Math.abs(target - m.opacity) > 0.01) done = false;
+            else m.opacity = target;
+        });
+        if (done && target === 1) {
+            obj.traverse(c => { if (c.userData && c.userData._origMat && c.material === c.userData._fadeMat) c.material = c.userData._origMat; });
+            cam.fading.delete(obj);
+        }
+    }
+}
+
+function clearFades() {
+    for (const obj of cam.fading) {
+        obj.traverse(c => { if (c.userData && c.userData._origMat) c.material = c.userData._origMat; });
+        obj.userData._fadeTarget = false;
+    }
+    cam.fading.clear();
+}
+
+// Pick a front three-quarter view of the character with the fewest models in the way.
+function frameCharacter(animateIt = true) {
+    if (!characterAnchor(_camFocus)) return;
+    const focus = _camFocus.clone();
+    focus.y = cam.focusY = THREE.MathUtils.clamp(focus.y * 0.92, 50, 140);
+
+    // Orient on the direction of travel so the walk reads from the front-side.
+    let heading = 0;
+    if (currentClip) {
+        const p = extractPathFromClip(currentClip);
+        const a = p[0], b = p[p.length - 1];
+        if (a && b && Math.hypot(b[0] - a[0], b[2] - a[2]) > 20) heading = Math.atan2(b[0] - a[0], b[2] - a[2]);
+    }
+    const dist = IS_SMALL ? 600 : 470;
+    const pitch = 0.26;
+    let best = null;
+    for (let i = 0; i < 18; i++) {
+        const step = i === 0 ? 0 : (i % 2 ? 1 : -1) * Math.ceil(i / 2) * (Math.PI / 9);
+        const az = heading + 0.95 + step;
+        const offset = new THREE.Vector3(Math.sin(az) * Math.cos(pitch), Math.sin(pitch), Math.cos(az) * Math.cos(pitch)).multiplyScalar(dist);
+        const blockers = blockersBetween(focus.clone().add(offset), focus).length;
+        const score = blockers * 10 + Math.abs(step);
+        if (!best || score < best.score) best = { offset, score };
+        if (blockers === 0) break;
+    }
+    cam.userMoved = false;
+    if (animateIt) {
+        cam.tween = { t: 0, dur: 1.2, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), offset: best.offset };
+    } else {
+        controls.target.copy(focus);
+        camera.position.copy(focus).add(best.offset);
+        controls.update();
+    }
+}
+
+function updateCamera(dt) {
+    const hasChar = cam.active && !cam.locked && characterAnchor(_camFocus);
+    if (hasChar) {
+        const ty = THREE.MathUtils.clamp(_camFocus.y * 0.92, 50, 140);
+        cam.focusY += (ty - cam.focusY) * (1 - Math.exp(-dt * 1.5));
+        _camFocus.y = cam.focusY;
+    }
+    if (cam.tween) {
+        // Ease from wherever the camera was onto the live character position.
+        const tw = cam.tween;
+        tw.t = Math.min(tw.t + dt / tw.dur, 1);
+        const e = tw.t < 0.5 ? 4 * tw.t ** 3 : 1 - (-2 * tw.t + 2) ** 3 / 2;
+        const goal = hasChar ? _camFocus : tw.fromTarget;
+        controls.target.lerpVectors(tw.fromTarget, goal, e);
+        _camStep.copy(goal).add(tw.offset);
+        camera.position.lerpVectors(tw.fromPos, _camStep, e);
+        if (tw.t >= 1) cam.tween = null;
+        camera.lookAt(controls.target);
+    } else if (hasChar) {
+        _camStep.subVectors(_camFocus, controls.target);
+        // A big jump means the clip looped back to its start: cut, don't swoop.
+        if (_camStep.lengthSq() > 250 * 250) _camStep.multiplyScalar(1);
+        else _camStep.multiplyScalar(1 - Math.exp(-dt * 5));
+        controls.target.add(_camStep);
+        camera.position.add(_camStep);
+        controls.update();
+    } else {
+        controls.update();
+    }
+
+    if (hasChar && !cam.tween) {
+        const now = performance.now();
+        if (now - cam.lastCheck > 100) {
+            cam.lastCheck = now;
+            const blocking = new Set(blockersBetween(camera.position, _camFocus));
+            for (const { obj } of cam.boxes) setFaded(obj, blocking.has(obj));
+        }
+    }
+    updateFades(dt);
+}
+
 let isRecording = false;
 let selectedClipIndex = -1;
 function animate() {
@@ -2076,6 +2265,7 @@ function animate() {
     const dt = clock.getDelta();
     if (isRecording) return;
     if (mixer && isPlaying) mixer.update(dt);
+    updateCamera(Math.min(dt, 0.1));
     if (!skinnedCharMesh) updateBodyMeshes(); // capsule fallback only
     if (timelineClips.length > 0) updatePlayhead();
     // Keep ground centered on character
@@ -2692,7 +2882,7 @@ function findNearestObject(keyword) {
     let best = null, bestDist = Infinity;
     // Get character's current position
     const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
+    characterAnchor(charPos);
     for (const obj of sceneObjects) {
         if (obj.userData._isGround) continue;
         const objKw = (obj.userData._keyword || '').toLowerCase();
@@ -2769,7 +2959,7 @@ async function classifyChat(userMsg) {
 // Resolve a direction string to [x, z] coordinates
 function resolveDirection(direction, scale = 400) {
     const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
+    characterAnchor(charPos);
     const cx = charPos.x, cz = charPos.z;
 
     if (direction.startsWith('near ')) {
@@ -2838,7 +3028,7 @@ async function handleAddMotion(params) {
         const target = findNearestObject(params.target_object);
         if (target) {
             const charPos = new THREE.Vector3();
-            if (currentBones) currentBones.getWorldPosition(charPos);
+            characterAnchor(charPos);
             targetAngle = Math.atan2(
                 target.position.x - charPos.x,
                 target.position.z - charPos.z
@@ -2962,50 +3152,17 @@ document.getElementById('panel-reopen').addEventListener('click', () => {
     document.getElementById('panel').classList.remove('collapsed');
 });
 
-// Reset view button — shows when camera deviates from default
-const defaultCamPos = new THREE.Vector3(0, 150, 400);
-const defaultTarget = new THREE.Vector3(0, 100, 0);
+// ?debug exposes camera state for automated checks.
+if (new URLSearchParams(location.search).has('debug')) {
+    window.__kinetik = { camera, controls, cam, characterAnchor, THREE, scene, renderer, sun, getGround: () => groundMesh };
+}
+
+// Recenter button: shows once the user has moved the camera themselves.
 const resetBtn = document.getElementById('reset-view');
-
-let _resetAnimating = false;
-resetBtn.addEventListener('click', () => {
-    // Smooth animated reset to character's current position
-    _resetAnimating = true;
-    const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
-    const targetTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
-    const targetCam = new THREE.Vector3(charPos.x, 250, charPos.z + 400);
-
-    let step = 0;
-    const duration = 30; // frames
-    const startCam = camera.position.clone();
-    const startTarget = controls.target.clone();
-    function animateReset() {
-        step++;
-        const t = step / duration;
-        const ease = t * t * (3 - 2 * t); // smoothstep
-        camera.position.lerpVectors(startCam, targetCam, ease);
-        controls.target.lerpVectors(startTarget, targetTarget, ease);
-        controls.update();
-        if (step < duration) requestAnimationFrame(animateReset);
-        else _resetAnimating = false;
-    }
-    animateReset();
-});
-
-// Check camera deviation every 500ms
+resetBtn.addEventListener('click', () => frameCharacter(true));
 setInterval(() => {
-    if (_resetAnimating) return;
-    const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
-    const currentTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
-    const posDiff = controls.target.distanceTo(currentTarget);
-    if (posDiff > 200) {
-        resetBtn.classList.add('visible');
-    } else {
-        resetBtn.classList.remove('visible');
-    }
-}, 500);
+    resetBtn.classList.toggle('visible', cam.active && cam.userMoved && !cam.locked);
+}, 300);
 
 // ========== SCENE EDITOR ==========
 const edToolbar = document.getElementById('editor-toolbar');
@@ -3470,9 +3627,10 @@ renderBtn.addEventListener('click', async () => {
 
     // Find orbit center — use character position
     const orbitCenter = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(orbitCenter);
+    characterAnchor(orbitCenter);
     orbitCenter.y = 0;
 
+    cam.locked = true;
     // Save original camera state
     const origPos = camera.position.clone();
     const origTarget = controls.target.clone();
@@ -3600,6 +3758,7 @@ renderBtn.addEventListener('click', async () => {
             controls.target.copy(origTarget);
             controls.enabled = true;
             controls.update();
+            cam.locked = false;
 
             // Stop music after render
             if (musicAudio) { musicAudio.pause(); musicAudio.currentTime = 0; }
@@ -3689,6 +3848,7 @@ async function handleImportFile(e) {
             isPlaying = true;
         }
 
+        cam.active = true;
         // Restore camera
         if (data.camera) {
             camera.position.set(...data.camera.position);
