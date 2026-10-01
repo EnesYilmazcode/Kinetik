@@ -4,7 +4,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { createCharacter } from './character.js';
 import { ASSETS, vegetationFor, realHeight, settingFor, makePathFrame, rng, layoutAlongRoute,
-    makeVegetation, makeFill, makeGroundCover, makeTrail, groundTexture } from './world.js';
+    makeVegetation, makeFill, makeGroundCover, makeTrail, groundTexture, makeWater, makeRoom, SHORE } from './world.js';
 
 // Kimodo motion server on Modal (scripts/modal_app.py). Override with ?api=<url>.
 const API = new URLSearchParams(location.search).get('api')
@@ -577,12 +577,7 @@ SETTING: the kind of place. The engine adds matching scenery (trees, grass, a tr
 RULES:
 - 6-10 models. Mix: 2-3 large + 3-4 medium + 2-3 small. Pick things that would sit beside a path through this place
 - Each keyword must be UNIQUE — no repeats
-- Be CREATIVE with keywords! Don't use the same objects every time. Examples:
-  Buildings: apartment, church, castle, tower, warehouse, factory, hotel, restaurant, bakery, cinema, museum, cottage, cabin
-  Nature: oak, pine, palm, willow, cactus, bush, boulder, stump, mushroom
-  Vehicles: sedan, truck, motorcycle, bicycle, taxi, ambulance, van, boat, scooter
-  Props: lamppost, hydrant, mailbox, barrel, crate, statue, fountain, well, windmill, flag, phone booth, umbrella, trashcan, planter
-  Furniture: sofa, armchair, bookshelf, desk, bed, dresser, TV, piano, rug, clock
+- Use ONLY keywords from the AVAILABLE MODELS list below; anything else has no model and is dropped. Vary your picks between scenes.
 - motion_prompt MUST start with "A person" and describe expressive, continuous motion
 - 2-3 lights, always include ambient (0.8-1.5). No fog.`;
 
@@ -594,7 +589,7 @@ function geminiProblem(res, data) {
 }
 
 async function callGemini(userPrompt, characterPath = null) {
-    let fullPrompt = SCENE_SYSTEM_PROMPT + '\n\nUser prompt: ' + userPrompt;
+    let fullPrompt = SCENE_SYSTEM_PROMPT + '\n\nAVAILABLE MODELS: ' + LIBRARY_KEYWORDS + '\n\nUser prompt: ' + userPrompt;
     if (characterPath && characterPath.length > 0) {
         // Send only x,z to Gemini (it doesn't need Y)
         const flatPath = characterPath.map(p => [p[0], p[2] || p[1]]);
@@ -1259,14 +1254,14 @@ const MODEL_MAP = {
     'shop': ['shop','store','cafe','bakery','restaurant','pizzeria','pharmacy','market','bar'],
     'car': ['car','sedan','taxi','vehicle','automobile'],
     'truck': ['truck','van','bus','pickup','ambulance'],
-    'street_lamp': ['lamp','lamppost','street lamp','light','pole','streetlight','floor lamp'],
+    'street_lamp': ['lamppost','street lamp','light','pole','streetlight'],
     'bench': ['bench','park bench','seat'],
     'hydrant': ['hydrant','fire hydrant'],
     'trash_can': ['trash','trash can','dumpster','bin','garbage'],
     'sofa': ['sofa','couch','armchair','loveseat','sectional'],
     'bookshelf': ['bookshelf','shelf','bookcase','cabinet'],
     'table': ['table','desk','counter','coffee table'],
-    'lamp': ['lamp','lantern','candle','torch'],
+    'lamp': ['lamp','floor lamp','table lamp','desk lamp','lantern','candle','torch'],
     'chair': ['chair','stool','ottoman'],
     'statue': ['statue','sculpture','monument','figure'],
     'fountain': ['fountain','well','birdbath','pond'],
@@ -1326,6 +1321,10 @@ const MODEL_MAP = {
     'police_car': ['police car','cop car','patrol car'],
     'taxi_cab': ['taxi','taxi cab','cab','yellow cab'],
 };
+
+// The names Gemini may pick from: one per library model, plus the procedural plants.
+const LIBRARY_KEYWORDS = [...Object.keys(MODEL_MAP).map(k => k.replace(/_/g, ' ')),
+    'oak', 'pine', 'palm', 'bush', 'boulder'].join(', ');
 
 // Build reverse lookup: keyword -> filename
 const KEYWORD_TO_FILE = {};
@@ -1727,14 +1726,14 @@ function groundY(x, z) {
 // Scenery between route positions s0 and s1. Near trees stay separate objects
 // so the camera can fade them; far ones, grass and flowers count as ground.
 function populateWorld(frame, s0, s1, avoid) {
-    const fill = makeFill(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid });
+    const fill = makeFill(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid, allowSide: world.allowSide });
     for (const o of fill.near) {
         o.userData._keyword = o.userData._veg;
         enableShadows(o);
         scene.add(o);
         sceneObjects.push(o);
     }
-    for (const g of [fill.far, makeGroundCover(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid: fill.spots })]) {
+    for (const g of [fill.far, makeGroundCover(frame, world.setting, s0, s1, { rand: world.rand, groundY, avoid: fill.spots, allowSide: world.allowSide })]) {
         if (!g.children.length) continue;
         g.userData._isGround = true;
         scene.add(g);
@@ -1763,6 +1762,20 @@ function extendWorld(fullPath) {
     const frame = makePathFrame(fullPath);
     const s1 = frame.length + 1500;
     world.frame = frame;
+    // Scenery laid past the old end may now be in the way of the new route.
+    const box = new THREE.Box3(), c = new THREE.Vector3(), size = new THREE.Vector3();
+    const blocking = sceneObjects.filter(o => {
+        if (o.userData._isGround || o.isLight || o.userData._mergedFill) return false;
+        box.setFromObject(o);
+        if (box.isEmpty()) return false;
+        box.getCenter(c); box.getSize(size);
+        return frame.distanceTo(c.x, c.z, 0) < Math.max(size.x, size.z) * 0.4 + 120;
+    });
+    for (const o of blocking) scene.remove(o);
+    if (blocking.length) {
+        sceneObjects = sceneObjects.filter(o => !blocking.includes(o));
+        world.spots = world.spots.filter(([x, z]) => frame.distanceTo(x, z, 0) > 120);
+    }
     if (s1 > world.s1 + 100) {
         world.spots.push(...populateWorld(frame, world.s1, s1, world.spots));
         world.s1 = s1;
@@ -1809,7 +1822,11 @@ async function buildScene(config) {
     const placedModels = setting === 'indoor'
         ? computeLayout(rawModels, 'indoor', charPath).map(m => ({ ...m, scale: realHeight(m.keyword, libraryFile(m.keyword), m.size) }))
         : layoutAlongRoute(rawModels, { frame, setting, resolveFile: libraryFile, rand });
-    world = setting === 'indoor' ? null : { frame, setting, rand, s1: frame.length + 1500, spots: [], trail: null };
+    world = setting === 'indoor' ? null : {
+        frame, setting, rand, s1: frame.length + 1500, spots: [], trail: null,
+        // The beach's sea is on side +1; nothing grows in it.
+        allowSide: setting === 'beach' ? (side, d) => !(side > 0 && d > SHORE - 60) : () => true,
+    };
 
     // The ground covers the route with a wide margin.
     let reach = 1200;
@@ -1926,6 +1943,18 @@ async function buildScene(config) {
         const discs = placedModels.map(m => [m.position[0], m.position[2], m.footprint || 60]);
         world.spots = populateWorld(frame, -900, world.s1, discs);
         layTrail();
+        if (setting === 'beach') {
+            const sea = makeWater(frame, groundY);
+            sea.userData._isGround = true;
+            scene.add(sea);
+            sceneObjects.push(sea);
+        }
+    } else {
+        for (const wall of makeRoom()) {
+            enableShadows(wall);
+            scene.add(wall);
+            sceneObjects.push(wall);
+        }
     }
 
     log(`${loadedCount} of ${totalMain} models placed`, 'scene', 'model-progress');
@@ -3392,7 +3421,7 @@ async function classifyChat(userMsg) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            contents: [{ parts: [{ text: CHAT_CLASSIFY_PROMPT + '\n\nUser says: ' + userMsg }] }],
+            contents: [{ parts: [{ text: CHAT_CLASSIFY_PROMPT + '\n\nAVAILABLE MODELS for add_object (use the closest): ' + LIBRARY_KEYWORDS + '\n\nUser says: ' + userMsg }] }],
             generationConfig: { temperature: 0.2 }
         })
     });
@@ -3421,6 +3450,21 @@ function resolveDirection(direction, scale = 400) {
 
     const jitter = () => (Math.random() - 0.5) * 150;
     const dist = 200 + Math.random() * scale;
+    // In an outdoor scene, left/right/front/behind follow the way the character is heading,
+    // and front/behind step off the trail so nothing lands where they walk.
+    if (world && ['left', 'right', 'front', 'behind'].includes(direction)) {
+        let best = 0, bestD = Infinity;
+        for (let s = 0; s <= world.frame.length; s += 20) {
+            const p = world.frame.pointAt(s);
+            const d = Math.hypot(p.x - cx, p.z - cz);
+            if (d < bestD) { bestD = d; best = s; }
+        }
+        const p = world.frame.pointAt(best);
+        const side = Math.random() < 0.5 ? 1 : -1;
+        const along = { front: dist, behind: -dist, left: jitter(), right: jitter() }[direction];
+        const across = { left: dist, right: -dist, front: side * 170, behind: side * 170 }[direction];
+        return [cx + p.tx * along + p.nx * across, cz + p.tz * along + p.nz * across];
+    }
     switch (direction) {
         case 'left':   return [cx - dist + jitter(), cz + jitter()];
         case 'right':  return [cx + dist + jitter(), cz + jitter()];
@@ -3436,9 +3480,13 @@ function resolveDirection(direction, scale = 400) {
 // Handle add_object action
 async function handleAddObject(params) {
     const [x, z] = resolveDirection(params.direction || 'random');
-    const position = [x, 0, z];
-    const sizeScales = { large: 250, medium: 100, small: 30 };
-    const targetScale = sizeScales[params.size] || 100;
+    const position = [x, groundY(x, z), z];
+    const file = libraryFile(params.keyword);
+    const targetScale = realHeight(params.keyword, file, params.size);
+    // Things with a front (benches, booths, signs) turn toward the character.
+    const anchor = new THREE.Vector3();
+    const facing = file && ASSETS[file]?.[2] === 'path' && characterAnchor(anchor)
+        ? Math.atan2(anchor.x - x, anchor.z - z) : Math.random() * Math.PI * 2;
 
     log(`Adding "${params.keyword}" (${params.direction || 'random'})...`, 'scene', 'chat-action');
     const run = currentRun;
@@ -3448,7 +3496,7 @@ async function handleAddObject(params) {
     // Try procedural first
     const procedural = tryProceduralModel(params.keyword, targetScale);
     if (procedural) {
-        procedural.position.set(x, 0, z);
+        procedural.position.set(x, groundY(x, z), z);
         procedural.userData._keyword = params.keyword;
         enableShadows(procedural);
         scene.add(procedural);
@@ -3461,7 +3509,7 @@ async function handleAddObject(params) {
     // Fetch from Poly Pizza
     const glbUrl = await findLocalModel(params.keyword, params.category || 11);
     if (glbUrl) {
-        const loaded = await loadGLBModel(glbUrl, position, targetScale, Math.random() * Math.PI * 2);
+        const loaded = await loadGLBModel(glbUrl, position, targetScale, facing);
         if (loaded) loaded.userData._keyword = params.keyword;
         if (loaded) {
             log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
@@ -4110,6 +4158,7 @@ const renderProgress = document.getElementById('render-progress');
 const renderFill = document.getElementById('render-fill');
 const renderBtn = document.getElementById('render-btn');
 let renderMode = false;
+const _orbitFocus = new THREE.Vector3();
 
 renderBtn.addEventListener('click', async () => {
     if (isRecording) return;
@@ -4130,8 +4179,8 @@ renderBtn.addEventListener('click', async () => {
     controls.enabled = false;
 
     // Zoom out to a high angle first
-    const ORBIT_RADIUS = 700;
-    const ORBIT_HEIGHT = 550;
+    const ORBIT_RADIUS = 650;
+    const ORBIT_HEIGHT = 420;
     const startAngle = Math.atan2(
         camera.position.x - orbitCenter.x,
         camera.position.z - orbitCenter.z
@@ -4235,6 +4284,11 @@ renderBtn.addEventListener('click', async () => {
             ? 2 * t * t
             : 1 - Math.pow(-2 * t + 2, 2) / 2;
         const angle = startAngle + eased * ROTATION_AMOUNT;
+        // Follow the character so a walk or run stays centered for the whole orbit.
+        if (characterAnchor(_orbitFocus)) {
+            _orbitFocus.y = 0;
+            orbitCenter.lerp(_orbitFocus, 1 - Math.exp(-dt * 4));
+        }
         camera.position.set(
             orbitCenter.x + Math.sin(angle) * ORBIT_RADIUS,
             ORBIT_HEIGHT,
@@ -4246,6 +4300,7 @@ renderBtn.addEventListener('click', async () => {
         if (!skinnedCharMesh) updateBodyMeshes();
         fadeBlockers();
         updateFades(dt);
+        updateEnvironmentFollow(); // keeps the sun's shadow area on the character
         renderer.render(scene, camera);
 
         if (t < 1) {
