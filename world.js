@@ -90,10 +90,11 @@ export function settingFor(prompt, given, sceneType) {
 export const LOOK = {
     park:   { ground: ['#6f9a45', '#5d8a3a', '#86a957'], trail: '#c8b48c', trailW: 130, grass: 1, flowers: 1 },
     forest: { ground: ['#4f6b33', '#5b4a32', '#3f5a2c'], trail: '#7b5f42', trailW: 100, grass: 0.8, flowers: 0.15 },
-    urban:  { ground: ['#8c8a85', '#7d7b77', '#97948e'], trail: '#b9b6ae', trailW: 220, grass: 0, flowers: 0 },
+    urban:  { ground: ['#56565b', '#4d4d52', '#5f5f63'], trail: '#c4c1b9', trailW: 260, grass: 0, flowers: 0, patches: 12 },
     beach:  { ground: ['#e3d3a5', '#d8c592', '#ecdcb3'], trail: '#cdb98a', trailW: 0, grass: 0.12, flowers: 0 },
     desert: { ground: ['#d6b383', '#c9a26f', '#dcc095'], trail: '#c4a273', trailW: 0, grass: 0.06, flowers: 0 },
     snow:   { ground: ['#eef2f6', '#e2e8ef', '#f6f8fa'], trail: '#d3dbe4', trailW: 110, grass: 0, flowers: 0 },
+    indoor: { ground: ['#a87a52', '#9a6e48', '#b4875e'], trail: null, trailW: 0, grass: 0, flowers: 0, planks: true },
     plain:  { ground: ['#7c9a52', '#6b8a46', '#8aa760'], trail: '#b9a57e', trailW: 110, grass: 0.7, flowers: 0.4 },
 };
 
@@ -164,6 +165,10 @@ export function rng(seed) {
 
 // ---------- layout of the scene's chosen objects ----------
 
+// On a beach the sea starts this far from the route, on its left (side +1). The default camera
+// frames from the front-right, so the sea ends up behind the character.
+export const SHORE = 650;
+
 // Bands are distances from the route's center line to the object's center.
 function bandFor(info, setting) {
     const h = info.height || 150;
@@ -172,10 +177,15 @@ function bandFor(info, setting) {
     if (info.veg) return [120 + r, 260 + r];
     if (h >= 1000) return [900 + r, 1400 + r];
     if (h >= 500) return setting === 'urban' ? [380 + r, 460 + r] : [650 + r, 1000 + r];
-    if (info.face === 'along' && h > 100) return setting === 'urban' ? [190, 230] : [260 + r, 420 + r];
-    if (h >= 300) return [110, 130]; // lamps sit at the trail edge
+    if (info.face === 'along' && h > 100) {
+        // Parallel to the route, so only its width matters sideways (about 0.6 of its height for vehicles).
+        const half = h * 0.6;
+        return setting === 'urban' ? [150 + half, 200 + half] : [260 + half, 420 + half];
+    }
+    if (h >= 300 && info.aspect < 0.3) return [110, 130]; // lamps and poles sit at the trail edge
+    if (h >= 300) return [300 + r, 520 + r];
     if (h >= 130) return [260 + r, 480 + r];
-    return [95 + r, 150 + r];
+    return [115 + r, 170 + r];
 }
 
 const REPEATS = {
@@ -192,6 +202,7 @@ export function layoutAlongRoute(models, { frame, setting, resolveFile, rand }) 
     const fits = (x, z, r) => placed.every(p => Math.hypot(p.position[0] - x, p.position[2] - z) > p.footprint + r);
 
     function put(m, info, s, side, band, heightOverride) {
+        if (setting === 'beach' && side > 0 && band[1] > SHORE - 80) side = -1;
         const h = heightOverride || (info.veg ? info.veg.lo + rand() * (info.veg.hi - info.veg.lo) : realHeight(m.keyword, info.file, m.size, rand));
         const r = Math.max(25, h * info.aspect * 0.5);
         for (let attempt = 0; attempt < 10; attempt++) {
@@ -325,7 +336,7 @@ const FILL = {
 
 // Scenery between route positions s0 and s1. Near objects stay separate so the
 // camera can fade them; far ones are merged into a few meshes.
-export function makeFill(frame, setting, s0, s1, { rand, groundY, avoid }) {
+export function makeFill(frame, setting, s0, s1, { rand, groundY, avoid, allowSide = () => true }) {
     const near = [], farParts = [];
     const spots = [...avoid];
     const clear = (x, z, r) => spots.every(([ax, az, ar]) => Math.hypot(ax - x, az - z) > ar + r);
@@ -336,6 +347,7 @@ export function makeFill(frame, setting, s0, s1, { rand, groundY, avoid }) {
                     // Thin out with distance so the foreground reads clearly.
                     if (rand() > chance * (d < 500 ? 1 : 0.85)) continue;
                     const ss = s + (rand() - 0.5) * step, dd = d + (rand() - 0.5) * step * 0.8;
+                    if (!allowSide(side, dd)) continue;
                     const p = frame.pointAt(ss);
                     const x = p.x + p.nx * dd * side, z = p.z + p.nz * dd * side;
                     if (frame.distanceTo(x, z) < dMin * 0.85) continue; // keep curves clear
@@ -346,7 +358,8 @@ export function makeFill(frame, setting, s0, s1, { rand, groundY, avoid }) {
                     const obj = makeVegetation(kind, h, setting, rand);
                     obj.position.set(x, groundY(x, z) - 2, z);
                     obj.rotation.y = rand() * Math.PI * 2;
-                    if (dd < 750) near.push(obj); else farParts.push(obj);
+                    // Past the route's end stays separate too: a later clip may turn into it.
+                    if (dd < 750 || ss > frame.length) near.push(obj); else farParts.push(obj);
                 }
             }
         }
@@ -382,7 +395,7 @@ export function mergeStatic(objects) {
 // ---------- ground cover and trail ----------
 
 // Grass tufts and flowers as instanced meshes, denser near the trail.
-export function makeGroundCover(frame, setting, s0, s1, { rand, groundY, avoid }) {
+export function makeGroundCover(frame, setting, s0, s1, { rand, groundY, avoid, allowSide = () => true }) {
     const look = LOOK[setting] || LOOK.plain;
     const group = new THREE.Group();
     if (!look.grass && !look.flowers) return group;
@@ -411,6 +424,7 @@ export function makeGroundCover(frame, setting, s0, s1, { rand, groundY, avoid }
             // Squared falloff puts most tufts near the trail.
             const d = near + Math.pow(rand(), 1.8) * (far - near);
             const side = rand() < 0.5 ? -1 : 1;
+            if (!allowSide(side, d)) continue;
             const p = frame.pointAt(s);
             const x = p.x + p.nx * d * side, z = p.z + p.nz * d * side;
             if (blocked(x, z)) continue;
@@ -500,8 +514,25 @@ export function groundTexture(setting, fallback) {
     const g = c.getContext('2d');
     g.fillStyle = colors[0];
     g.fillRect(0, 0, 512, 512);
+    if (look && look.planks) {
+        // Floorboards: rows of planks with staggered joints and a little color variation.
+        for (let row = 0; row < 16; row++) {
+            const y = row * 32;
+            let x = -((row * 97) % 160);
+            while (x < 512) {
+                const len = 120 + Math.random() * 100;
+                g.fillStyle = colors[Math.floor(Math.random() * 3)];
+                g.fillRect(x, y, len, 32);
+                g.fillStyle = 'rgba(40,25,15,0.35)';
+                g.fillRect(x, y, 2, 32);
+                x += len;
+            }
+            g.fillStyle = 'rgba(40,25,15,0.4)';
+            g.fillRect(0, y, 512, 2);
+        }
+    }
     // Big soft patches, drawn wrapped so the texture tiles.
-    for (let i = 0; i < 70; i++) {
+    for (let i = 0; i < (look && look.planks ? 0 : (look && look.patches) || 70); i++) {
         const x = Math.random() * 512, y = Math.random() * 512, r = 30 + Math.random() * 90;
         const col = new THREE.Color(colors[1 + (i % 2)]);
         for (const [ox, oy] of [[0, 0], [-512, 0], [512, 0], [0, -512], [0, 512]]) {
@@ -524,4 +555,56 @@ export function groundTexture(setting, fallback) {
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.anisotropy = 4;
     return t;
+}
+
+// ---------- water and rooms ----------
+
+// The sea along the left of the route, from the shoreline out to the fog.
+export function makeWater(frame, groundY) {
+    const p = frame.pointAt(frame.length / 2);
+    const g = new THREE.PlaneGeometry(9000, 9000, 1, 1);
+    g.rotateX(-Math.PI / 2);
+    const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+        color: '#3d8fb8', roughness: 0.18, metalness: 0, transparent: true, opacity: 0.92,
+    }));
+    // Shift the plane so its near edge runs along the shoreline, parallel to the route.
+    const off = SHORE + 4500;
+    mesh.position.set(p.x + p.nx * off, groundY(p.x, p.z) + 3, p.z + p.nz * off);
+    mesh.rotation.y = Math.atan2(p.tx, p.tz);
+    mesh.receiveShadow = true;
+    mesh.userData._water = true;
+    // Wet sand: a darker strip at the waterline.
+    const sand = new THREE.Mesh(new THREE.PlaneGeometry(9000, 220).rotateX(-Math.PI / 2),
+        new THREE.MeshStandardMaterial({ color: '#b9a678', roughness: 0.9, transparent: true, opacity: 0.7, depthWrite: false }));
+    sand.position.set(p.x + p.nx * (SHORE - 60), groundY(p.x, p.z) + 1, p.z + p.nz * (SHORE - 60));
+    sand.rotation.y = Math.atan2(p.tx, p.tz) + Math.PI / 2;
+    const group = new THREE.Group();
+    group.add(mesh, sand);
+    return group;
+}
+
+// Three walls around the origin, open toward -z where the camera starts. The indoor
+// layout puts furniture against +z, so the room uses the world axes, not the route.
+// Each wall is its own object so the camera can fade one without the others.
+export function makeRoom() {
+    const wallMat = new THREE.MeshStandardMaterial({ color: '#e8e1d6', roughness: 0.95 });
+    const trimMat = new THREE.MeshStandardMaterial({ color: '#f6f3ee', roughness: 0.8 });
+    const W = 1000, D = 900, H = 290, T = 12;
+    return [
+        [W, 0, D * 0.55, 0],             // far wall
+        [D, -W / 2, 0.05 * D, Math.PI / 2], // left
+        [D, W / 2, 0.05 * D, Math.PI / 2],  // right
+    ].map(([len, x, z, rot]) => {
+        const g = new THREE.Group();
+        const w = new THREE.Mesh(new THREE.BoxGeometry(len, H, T), wallMat);
+        w.position.y = H / 2;
+        w.receiveShadow = true;
+        const base = new THREE.Mesh(new THREE.BoxGeometry(len, 14, T + 4), trimMat);
+        base.position.y = 7;
+        g.add(w, base);
+        g.position.set(x, 0, z);
+        g.rotation.y = rot;
+        g.userData._wall = true;
+        return g;
+    });
 }
