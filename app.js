@@ -2398,7 +2398,7 @@ function blockersBetween(camPos, focus) {
     const out = [];
     for (const { obj, box } of modelBoxes()) {
         if (obj === selectedObject) continue;
-        if (box.distanceToPoint(camPos) < 140) { out.push(obj); continue; } // right in front of the lens
+        if (box.distanceToPoint(camPos) < 25) { out.push(obj); continue; } // the camera is (nearly) inside it
         for (const p of pts) {
             if (box.containsPoint(p)) continue; // character is inside this box (under a canopy)
             const len = camPos.distanceTo(p);
@@ -2469,16 +2469,24 @@ function frameCharacter(animateIt = true) {
         if (a && b && Math.hypot(b[0] - a[0], b[2] - a[2]) > 20) heading = Math.atan2(b[0] - a[0], b[2] - a[2]);
     }
     const dist = IS_SMALL ? 600 : 470;
-    const pitch = 0.26;
     let best = null;
-    for (let i = 0; i < 18; i++) {
-        const step = i === 0 ? 0 : (i % 2 ? 1 : -1) * Math.ceil(i / 2) * (Math.PI / 9);
-        const az = heading + 0.95 + step;
-        const offset = new THREE.Vector3(Math.sin(az) * Math.cos(pitch), Math.sin(pitch), Math.cos(az) * Math.cos(pitch)).multiplyScalar(dist);
-        const blockers = blockersBetween(focus.clone().add(offset), focus).length;
-        const score = blockers * 10 + Math.abs(step);
-        if (!best || score < best.score) best = { offset, score };
-        if (blockers === 0) break;
+    // Low angles first; climb only when every low view is blocked.
+    // Big blockers (buildings) cost more than small ones (bushes).
+    search:
+    for (const [pitch, cost] of [[0.26, 0], [0.45, 4], [0.68, 9]]) {
+        for (let i = 0; i < 18; i++) {
+            const step = i === 0 ? 0 : (i % 2 ? 1 : -1) * Math.ceil(i / 2) * (Math.PI / 9);
+            const az = heading + 0.95 + step;
+            const offset = new THREE.Vector3(Math.sin(az) * Math.cos(pitch), Math.sin(pitch), Math.cos(az) * Math.cos(pitch)).multiplyScalar(dist);
+            let weight = 0;
+            for (const o of blockersBetween(focus.clone().add(offset), focus)) {
+                const box = cam.boxes.find(b => b.obj === o)?.box;
+                weight += box ? THREE.MathUtils.clamp((box.max.y - box.min.y) / 80, 1, 6) : 1;
+            }
+            const score = weight * 10 + Math.abs(step) + cost;
+            if (!best || score < best.score) best = { offset, score };
+            if (weight === 0) break search;
+        }
     }
     cam.userMoved = false;
     if (animateIt) {
@@ -2529,15 +2537,22 @@ function updateCamera(dt) {
         controls.update();
     }
 
-    if (hasChar && !cam.tween) {
-        const now = performance.now();
-        if (now - cam.lastCheck > 100) {
-            cam.lastCheck = now;
-            const blocking = new Set(blockersBetween(camera.position, _camFocus));
-            for (const { obj } of cam.boxes) setFaded(obj, blocking.has(obj));
-        }
-    }
+    if (hasChar && !cam.tween) fadeBlockers(_camFocus);
     updateFades(dt);
+}
+
+// Ghost whatever stands between the camera and the character (10 checks a second).
+const _fadeFocus = new THREE.Vector3();
+function fadeBlockers(focus) {
+    const now = performance.now();
+    if (now - cam.lastCheck < 100) return;
+    cam.lastCheck = now;
+    if (!focus) {
+        if (!characterAnchor(_fadeFocus)) return;
+        focus = _fadeFocus;
+    }
+    const blocking = new Set(blockersBetween(camera.position, focus));
+    for (const { obj } of cam.boxes) setFaded(obj, blocking.has(obj));
 }
 
 let isRecording = false;
@@ -4044,6 +4059,7 @@ renderBtn.addEventListener('click', async () => {
     orbitCenter.y = 0;
 
     cam.locked = true;
+    clearFades();
     document.body.classList.add('rendering');
     const renderLabel = document.getElementById('render-label');
     // Save original camera state
@@ -4074,6 +4090,8 @@ renderBtn.addEventListener('click', async () => {
             const e = t * t * (3 - 2 * t); // smoothstep
             camera.position.lerpVectors(zoomFrom, zoomTarget, e);
             camera.lookAt(orbitCenter.x, 40, orbitCenter.z);
+            fadeBlockers();
+            updateFades(1 / 60);
             renderer.render(scene, camera);
             if (t < 1) requestAnimationFrame(zoomStep);
             else resolve();
@@ -4164,6 +4182,8 @@ renderBtn.addEventListener('click', async () => {
 
         if (mixer) mixer.update(dt);
         if (!skinnedCharMesh) updateBodyMeshes();
+        fadeBlockers();
+        updateFades(dt);
         renderer.render(scene, camera);
 
         if (t < 1) {
