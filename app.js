@@ -1917,7 +1917,7 @@ async function generate() {
             const motionRes = await fetch(`${API}/generate-motion`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ prompt: motionPrompt, duration })
+                body: JSON.stringify({ prompt: motionPrompt, duration, variant: attempt })
             });
             if (!motionRes.ok) throw new Error(await motionError(motionRes));
             bvhText = await motionRes.text();
