@@ -2,28 +2,18 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Kinetik</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c5cbf'/><path d='M11 8v16M21 8l-8 8 8 8' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div id="topbar">
-        <h1 id="logo-btn" style="cursor:pointer" title="Return to home">KINETIK</h1>
-        <span style="flex:1"></span>
-        <button id="path-toggle" style="padding:5px 12px;background:var(--bg-input);border:1px solid var(--border);border-radius:6px;color:var(--text-2);font-family:'DM Sans',sans-serif;font-size:11px;cursor:pointer;transition:all 0.2s;font-weight:500;display:none">Show Path</button>
-        <div style="width:1px;height:20px;background:var(--border)"></div>
-        <button class="topbar-btn" id="render-btn" title="Render orbit video"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="6" r="4"/><circle cx="6" cy="6" r="1.5" fill="currentColor" stroke="none"/></svg> Render</button>
-        <input type="file" id="import-file" accept=".kinetik" style="display:none">
-    </div>
-
     <div id="main">
         <div id="viewport">
             <div id="gen-info" style="display:none"></div>
-            <button id="panel-reopen" title="Show activity">&#9776;</button>
-            <div class="recording-badge" id="rec-badge">&#9679; REC</div>
-            <button id="reset-view">Reset View</button>
+            <div class="recording-badge" id="rec-badge">REC</div>
+            <button id="reset-view" title="Frame the character again">Recenter</button>
             <div id="editor-toolbar">
                 <button class="ed-btn ed-build-only" id="ed-move" title="Move mode (M)" style="display:none"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 2v10M2 7h10M7 2l-2 2M7 2l2 2M7 12l-2-2M7 12l2-2M2 7l2-2M2 7l2 2M12 7l-2-2M12 7l-2 2"/></svg> Move</button>
                 <button class="ed-btn ed-build-only" id="ed-rotate" title="Rotate (R)" style="display:none"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 7a5 5 0 0 1 10 0"/><path d="M9 4l3 3-3 3"/></svg> Rotate</button>
@@ -37,72 +27,104 @@
             <div id="render-overlay">
                 <div id="render-dot"></div>
                 <div id="render-hint">Click a point to orbit around</div>
-                <div id="render-progress">
-                    <div>Recording...</div>
-                    <div class="render-bar"><div class="render-fill" id="render-fill"></div></div>
+            </div>
+            <div id="render-progress">
+                <div class="rp-row"><span class="rp-dot"></span><span id="render-label">Recording orbit</span></div>
+                <div class="render-bar"><div class="render-fill" id="render-fill"></div></div>
+            </div>
+
+            <div id="gen-overlay" aria-live="polite">
+                <div class="go-card">
+                    <div class="go-eyebrow">Building your scene</div>
+                    <div class="go-prompt" id="go-prompt"></div>
+                    <div class="steps" id="go-steps"></div>
+                    <div class="go-note" id="go-note"></div>
+                    <div class="go-actions" id="go-actions">
+                        <button class="btn-ghost" id="go-back">Back</button>
+                        <button class="btn-primary" id="go-retry">Try again</button>
+                    </div>
                 </div>
             </div>
-            <div id="welcome">
-              <div class="w-left">
-                <div class="w-brand">kinetik</div>
-                <div class="w-tagline">Describe a scene.<br><span>Watch it come alive.</span></div>
-                <div class="w-input-wrap">
-                  <input type="text" id="welcome-input" placeholder="A person sneaks through a forest..." autofocus>
-                </div>
 
-
-                <div class="w-examples">
-                    <div class="w-ex" data-prompt="A person walks through a busy city street">
-                        <span class="w-ex-label">City</span>
-                    </div>
-<div class="w-ex" data-prompt="A person jogs through a park at sunrise">
-                        <span class="w-ex-label">Park</span>
-                    </div>
-                    <div class="w-ex" data-prompt="A person explores a spooky graveyard at night">
-                        <span class="w-ex-label">Spooky</span>
-                    </div>
-                    <div class="w-ex" data-prompt="A person celebrates winning on a sports field">
-                        <span class="w-ex-label">Victory</span>
-                    </div>
+            <div id="prompt-dock">
+                <div id="prompt-status"></div>
+                <div id="chat-input-bar">
+                    <input type="text" id="chat-input" placeholder="What happens next? Try &quot;now he jumps forward&quot;" autocomplete="off">
+                    <button id="chat-send" title="Send (Enter)" aria-label="Send"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5L8 3l4.5 4.5"/></svg></button>
                 </div>
-              </div>
-              <div class="w-right">
-                <div id="w-preview"></div>
-                <div class="w-motion-label" id="w-motion-label">backflip</div>
-              </div>
             </div>
+
             <div id="timeline-bar">
-                <div id="timeline-playhead"></div>
                 <div id="timeline-controls">
                     <button class="tl-btn" id="tl-playpause" title="Play/Pause (Space)"><svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg></button>
                     <span class="tl-time" id="tl-time">0.0s</span>
                 </div>
-                <div id="timeline-clips"></div>
-
-
+                <div id="timeline-track">
+                    <div id="timeline-ruler"></div>
+                    <div id="timeline-clips"></div>
+                    <div id="timeline-playhead"></div>
+                </div>
             </div>
         </div>
 
+        <div id="topbar">
+            <div class="tb-left">
+                <h1 id="logo-btn" title="Back to start">kinetik</h1>
+                <button id="gpu-pill" class="gpu-pill" data-state="checking" title="Motion model status"><span class="gpu-dot"></span><span id="gpu-text">Connecting</span></button>
+            </div>
+            <div class="tb-right">
+                <button class="topbar-btn" id="path-toggle" style="display:none">Show path</button>
+                <button class="topbar-btn primary" id="render-btn" style="display:none" title="Record an orbit video of the scene"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="6" r="4.5"/><circle cx="6" cy="6" r="1.8" fill="currentColor" stroke="none"/></svg> Render</button>
+                <input type="file" id="import-file" accept=".kinetik" style="display:none">
+            </div>
+        </div>
+
+        <button id="panel-reopen" title="Show activity"><span class="pr-dot"></span><span id="panel-reopen-text">Activity</span></button>
         <div id="panel" class="collapsed">
             <div id="panel-header">
                 <button class="panel-tab active" id="tab-activity">Activity</button>
-                <button class="panel-tab" id="tab-add">Add</button>
-                <div id="panel-collapse-wrap">
-                    <button id="panel-collapse" style="background:none;border:none;color:var(--text-3);cursor:pointer;font-size:16px" title="Collapse">&times;</button>
-                </div>
+                <button class="panel-tab" id="tab-add">Library</button>
+                <button id="panel-collapse" title="Hide panel" aria-label="Hide panel"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M7.5 3L4.5 6l3 3"/></svg></button>
             </div>
-            <div id="console"></div>
-            <div id="chat-input-bar">
-                <input type="text" id="chat-input" placeholder="Add motion, object, or action..." autocomplete="off">
+            <div id="console">
+                <div id="runs"></div>
+                <details id="log-details">
+                    <summary>Details</summary>
+                    <div id="log-list"></div>
+                </details>
             </div>
             <div id="add-tab-content">
                 <div id="add-create-wrap">
-                    <input type="text" id="add-create-input" placeholder="Create custom model...">
+                    <input type="text" id="add-create-input" placeholder="Create a custom model...">
                     <div id="add-create-status"></div>
                 </div>
+                <div id="add-tab-hint">Click a model, then click in the scene to place it.</div>
                 <div id="add-tab-grid"></div>
             </div>
         </div>
+
+        <div id="welcome">
+          <div class="w-left">
+            <div class="w-brand">kinetik</div>
+            <div class="w-tagline">Describe a scene.<br><span>Watch it come alive.</span></div>
+            <div class="w-input-wrap">
+              <input type="text" id="welcome-input" placeholder="A person sneaks through a forest..." autofocus autocomplete="off">
+              <button class="w-input-arrow" id="welcome-go" aria-label="Generate"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10M8.5 3.5L13 8l-4.5 4.5"/></svg></button>
+            </div>
+            <div class="w-examples">
+                <button class="w-ex" data-prompt="A person walks through a busy city street"><span class="w-ex-label">City</span></button>
+                <button class="w-ex" data-prompt="A person jogs through a park at sunrise"><span class="w-ex-label">Park</span></button>
+                <button class="w-ex" data-prompt="A person explores a spooky graveyard at night"><span class="w-ex-label">Spooky</span></button>
+                <button class="w-ex" data-prompt="A person celebrates winning on a sports field"><span class="w-ex-label">Victory</span></button>
+            </div>
+            <div class="w-status" id="w-status"><span class="gpu-dot"></span><span id="w-status-text">Connecting to the motion model</span></div>
+          </div>
+          <div class="w-right">
+            <div id="w-preview"></div>
+            <div class="w-motion-label" id="w-motion-label">backflip</div>
+          </div>
+        </div>
+
         <!-- Hidden elements for JS references -->
         <textarea id="prompt-input" style="display:none"></textarea>
         <input id="duration-input" type="hidden" value="5">

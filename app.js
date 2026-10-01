@@ -14,35 +14,148 @@ const viewport = document.getElementById('viewport');
 
 // Three.js setup
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xd8d8d0);
+const IS_SMALL = Math.min(window.innerWidth, window.innerHeight) < 600;
 
-const camera = new THREE.PerspectiveCamera(60, viewport.clientWidth / viewport.clientHeight, 1, 10000);
-camera.position.set(0, 150, 400);
+const camera = new THREE.PerspectiveCamera(50, viewport.clientWidth / viewport.clientHeight, 5, 12000);
+camera.position.set(380, 300, 560);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(viewport.clientWidth, viewport.clientHeight);
-renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 viewport.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 100, 0);
+controls.target.set(0, 30, 0);
+// The empty stage turns slowly until there is a scene to look at.
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.35;
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 90;
+controls.maxDistance = 2500;
+controls.maxPolarAngle = Math.PI * 0.48; // stay above the ground
 controls.update();
 
-// Grid
-const grid = new THREE.GridHelper(500, 20, 0xc0c0b8, 0xccccc4);
+// Grid (empty state only; hidden once a scene is built)
+const grid = new THREE.GridHelper(1200, 24, 0xbdb9ad, 0xcfccc2);
+grid.material.transparent = true;
+grid.material.opacity = 0.6;
 scene.add(grid);
 
-// Lights — soft key + fill + rim for nice form
-scene.add(new THREE.AmbientLight(0x303050, 1.5));
-const keyLight = new THREE.DirectionalLight(0xffffff, 2);
-keyLight.position.set(100, 200, 150);
-scene.add(keyLight);
-const fillLight = new THREE.DirectionalLight(0x8888ff, 0.8);
-fillLight.position.set(-100, 100, -50);
-scene.add(fillLight);
-const rimLight = new THREE.DirectionalLight(0xa78bfa, 1);
-rimLight.position.set(0, 50, -200);
-scene.add(rimLight);
+// ========== ENVIRONMENT: sky, fog, sun + hemisphere ==========
+// Mood presets. Colors are what you see on screen (the sky skips tone mapping).
+const ENV_PRESETS = {
+    studio: { top: '#e9e6de', horizon: '#f2f0ea', below: '#e4e1d8', sun: '#fff6ea', sunI: 2.4, sky: '#eef0f6', ground: '#b3ab98', hemiI: 1.9, fog: [900, 3200], exposure: 1.0 },
+    day:    { top: '#7fa6d6', horizon: '#e6e4da', below: '#cfcbbd', sun: '#fff1dc', sunI: 2.8, sky: '#dce7f5', ground: '#9a8e76', hemiI: 2.0, fog: [900, 3600], exposure: 1.0 },
+    dusk:   { top: '#5a6aa0', horizon: '#f1c9a2', below: '#b99a84', sun: '#ffc489', sunI: 2.6, sky: '#c8c4e0', ground: '#7d6858', hemiI: 1.6, fog: [800, 3200], exposure: 1.05 },
+    night:  { top: '#0f1729', horizon: '#34405f', below: '#20263a', sun: '#b4c6ff', sunI: 2.4, sky: '#7b8bc0', ground: '#3b3a4c', hemiI: 1.6, fog: [600, 2800], exposure: 1.25 },
+    indoor: { top: '#ddd6cb', horizon: '#eee8de', below: '#d6cfc3', sun: '#fff0dc', sunI: 2.2, sky: '#f4ede2', ground: '#9c8d79', hemiI: 2.0, fog: [900, 3000], exposure: 1.0 },
+};
+
+const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(5000, 32, 16),
+    new THREE.ShaderMaterial({
+        uniforms: {
+            top: { value: new THREE.Color() },
+            horizon: { value: new THREE.Color() },
+            below: { value: new THREE.Color() },
+        },
+        vertexShader: `varying vec3 vWorld;
+            void main() { vec4 w = modelMatrix * vec4(position, 1.0); vWorld = w.xyz;
+            gl_Position = projectionMatrix * viewMatrix * w; }`,
+        fragmentShader: `uniform vec3 top; uniform vec3 horizon; uniform vec3 below; varying vec3 vWorld;
+            void main() { float h = normalize(vWorld - cameraPosition).y;
+            vec3 c = h > 0.0 ? mix(horizon, top, pow(min(h * 1.6, 1.0), 0.7)) : mix(horizon, below, min(-h * 6.0, 1.0));
+            gl_FragColor = vec4(c, 1.0);
+            #include <colorspace_fragment>
+            }`,
+        side: THREE.BackSide, depthWrite: false, fog: false, toneMapped: false,
+    })
+);
+sky.renderOrder = -1;
+sky.frustumCulled = false;
+scene.add(sky);
+
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x888888, 1.2);
+scene.add(hemiLight);
+
+const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+const SUN_OFFSET = new THREE.Vector3(320, 560, 260);
+sun.position.copy(SUN_OFFSET);
+sun.castShadow = true;
+sun.shadow.mapSize.set(IS_SMALL ? 1024 : 2048, IS_SMALL ? 1024 : 2048);
+Object.assign(sun.shadow.camera, { left: -520, right: 520, top: 520, bottom: -520, near: 50, far: 2000 });
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.8;
+scene.add(sun, sun.target);
+
+// Soft contact shadow under the character, so feet read as grounded
+// even where the shadow map is coarse.
+const contactShadow = (() => {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(0,0,0,0.55)');
+    grad.addColorStop(0.5, 'rgba(0,0,0,0.22)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 128, 128);
+    const m = new THREE.Mesh(
+        new THREE.PlaneGeometry(90, 90),
+        new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false, opacity: 0.6 })
+    );
+    m.rotation.x = -Math.PI / 2;
+    m.position.y = 0.6;
+    m.renderOrder = 1;
+    m.visible = false;
+    scene.add(m);
+    return m;
+})();
+
+let envName = 'studio';
+function applyEnvironment(name) {
+    const p = ENV_PRESETS[name] || ENV_PRESETS.day;
+    envName = name;
+    sky.material.uniforms.top.value.set(p.top);
+    sky.material.uniforms.horizon.value.set(p.horizon);
+    sky.material.uniforms.below.value.set(p.below);
+    scene.fog = new THREE.Fog(p.horizon, p.fog[0], p.fog[1]);
+    sun.color.set(p.sun);
+    sun.intensity = p.sunI;
+    hemiLight.color.set(p.sky);
+    hemiLight.groundColor.set(p.ground);
+    hemiLight.intensity = p.hemiI;
+    renderer.toneMappingExposure = p.exposure;
+}
+applyEnvironment('studio');
+
+// Pick a mood from the prompt and scene type.
+function environmentFor(prompt, sceneType) {
+    const p = (prompt || '').toLowerCase();
+    if (/\b(night|midnight|spooky|haunted|graveyard|cemetery|moon|moonlit|dark)\b/.test(p)) return 'night';
+    if (/\b(sunset|sunrise|dusk|dawn|evening|golden hour)\b/.test(p)) return 'dusk';
+    if (sceneType === 'indoor') return 'indoor';
+    return 'day';
+}
+
+// Every mesh under obj casts and receives shadows.
+function enableShadows(obj) {
+    obj.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+}
+
+// The BVH root bone stays at the origin; Hips carries the actual travel.
+let _hipsBone = null, _hipsRoot = null;
+function characterAnchor(out) {
+    if (!currentBones) return null;
+    if (_hipsRoot !== currentBones) { _hipsRoot = currentBones; _hipsBone = findBone(currentBones, 'Hips') || currentBones; }
+    return _hipsBone.getWorldPosition(out);
+}
 
 let mixer = null;
 let currentBones = null;
@@ -469,6 +582,13 @@ RULES:
 - motion_prompt MUST start with "A person" and describe expressive, continuous motion
 - 2-3 lights, always include ambient (0.8-1.5). No fog.`;
 
+// A readable reason for a Gemini call that came back without text.
+function geminiProblem(res, data) {
+    if (!GEMINI_KEY) return 'No Gemini API key set (GEMINI_KEY in app.js)';
+    if (data?.error?.message) return `Gemini: ${data.error.message}`;
+    return `Gemini returned no text (HTTP ${res.status})`;
+}
+
 async function callGemini(userPrompt, characterPath = null) {
     let fullPrompt = SCENE_SYSTEM_PROMPT + '\n\nUser prompt: ' + userPrompt;
     if (characterPath && characterPath.length > 0) {
@@ -484,9 +604,9 @@ async function callGemini(userPrompt, characterPath = null) {
             generationConfig: { temperature: 0.7 }
         })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Gemini returned empty response');
+    if (!text) throw new Error(geminiProblem(res, data));
     // Strip markdown code fences if present
     const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     return JSON.parse(clean);
@@ -528,7 +648,7 @@ function createTexturedGround(size, baseColor) {
     }
 
     // Add subtle grid lines for spatial reference
-    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.15)`;
+    ctx.strokeStyle = `rgba(${Math.max(0,r-30)},${Math.max(0,g-30)},${Math.max(0,b-30)},0.08)`;
     ctx.lineWidth = 1;
     for (let i = 0; i <= 512; i += 64) {
         ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 512); ctx.stroke();
@@ -536,6 +656,8 @@ function createTexturedGround(size, baseColor) {
     }
 
     const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = 4;
     texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
     texture.repeat.set(size / 200, size / 200);
 
@@ -543,6 +665,7 @@ function createTexturedGround(size, baseColor) {
     const mat = new THREE.MeshStandardMaterial({ map: texture, roughness: 0.92 });
     const plane = new THREE.Mesh(geo, mat);
     plane.rotation.x = -Math.PI / 2;
+    plane.receiveShadow = true;
     return plane;
 }
 
@@ -668,6 +791,7 @@ function extendEnvironmentAlongPath(newPath) {
             if (proc) {
                 proc.position.set(fx, 0, fz);
                 proc.rotation.y = Math.random() * Math.PI * 2;
+                enableShadows(proc);
                 scene.add(proc);
                 sceneObjects.push(proc);
                 added++;
@@ -756,7 +880,7 @@ function togglePath() {
     if (pathLine) pathLine.visible = pathVisible;
     const btn = document.getElementById('path-toggle');
     btn.classList.toggle('active', pathVisible);
-    btn.textContent = pathVisible ? 'Hide Path' : 'Show Path';
+    btn.textContent = pathVisible ? 'Hide path' : 'Show path';
 }
 document.getElementById('path-toggle').addEventListener('click', togglePath);
 
@@ -1275,6 +1399,7 @@ async function loadGLBModel(url, position, targetHeight, rotationY) {
             const scaledBox = new THREE.Box3().setFromObject(model);
             model.position.set(position[0], position[1] - scaledBox.min.y, position[2]);
             if (rotationY) model.rotation.y = rotationY;
+            enableShadows(model);
             scene.add(model);
             sceneObjects.push(model);
             resolve(model);
@@ -1581,26 +1706,25 @@ function computeLayout(models, sceneType, charPath) {
 }
 
 async function buildScene(config) {
+    clearFades();
     sceneObjects.forEach(obj => scene.remove(obj));
     sceneObjects = [];
     grid.visible = false;
     Object.keys(modelCache).forEach(k => delete modelCache[k]);
 
-    // Ground created after layout so we know the world extent
-    const groundBase = (config.scene.ground && config.scene.ground.color) || '#888877';
+    // Ground created after layout so we know the world extent.
+    // Gemini's color, lifted a little toward a warm gray so asphalt and soil
+    // read as surfaces instead of holes under tone mapping.
+    const groundBase = '#' + new THREE.Color((config.scene.ground && config.scene.ground.color) || '#888877')
+        .lerp(new THREE.Color('#d9d4c7'), 0.22).getHexString();
 
-    // Lights
+    // Lights: the sun and sky light come from the environment preset.
+    // Only Gemini's point lights (campfires, lamps) are added on top.
     for (const light of (config.scene.lights || [])) {
         let l;
         const color = light.color || '#ffffff';
         const intensity = light.intensity || 1;
-        if (light.type === 'ambient') {
-            l = new THREE.AmbientLight(color, intensity);
-        } else if (light.type === 'directional') {
-            l = new THREE.DirectionalLight(color, intensity);
-            const p = light.position || [100, 200, 100];
-            l.position.set(p[0], p[1], p[2]);
-        } else if (light.type === 'point') {
+        if (light.type === 'point') {
             l = new THREE.PointLight(color, intensity, 2000);
             const p = light.position || [0, 200, 0];
             l.position.set(p[0], p[1], p[2]);
@@ -1608,8 +1732,7 @@ async function buildScene(config) {
         if (l) { scene.add(l); sceneObjects.push(l); }
     }
 
-    scene.fog = null;
-    scene.background = new THREE.Color(0xd8d8d0);
+    applyEnvironment(environmentFor(config._prompt, config.scene.type));
 
     // Layout engine: Gemini picks objects, code positions them
     const charPath = config._characterPath || [[0, 0]];
@@ -1633,6 +1756,25 @@ async function buildScene(config) {
     groundMesh.userData._isGround = true;
     scene.add(groundMesh);
     sceneObjects.push(groundMesh);
+
+    // A wide ring with the same texture runs from under the ground's edge out
+    // to the fog, so the ground has no visible edge against the sky.
+    const SKIRT_R = 6000;
+    const skirtMap = groundMesh.material.map.clone();
+    skirtMap.repeat.set(SKIRT_R / 100, SKIRT_R / 100);
+    const phase = (groundSize / 2 - SKIRT_R) / 200; // line the texture up with the ground's
+    skirtMap.offset.set(phase, phase);
+    skirtMap.needsUpdate = true;
+    const skirt = new THREE.Mesh(
+        new THREE.RingGeometry(groundSize * 0.42, SKIRT_R, 96, 1),
+        new THREE.MeshStandardMaterial({ map: skirtMap, roughness: 0.92 })
+    );
+    skirt.rotation.x = -Math.PI / 2;
+    skirt.position.y = -1.5;
+    skirt.receiveShadow = true;
+    skirt.userData._isGround = true;
+    scene.add(skirt);
+    sceneObjects.push(skirt);
 
     // Place loading placeholders at computed positions BEFORE loading models
     const placeholders = [];
@@ -1668,7 +1810,7 @@ async function buildScene(config) {
     let phIdx = 0;
     const mainModels = placedModels.filter(m => !m._isFill);
     const fillModels = placedModels.filter(m => m._isFill);
-    let loadedCount = 0;
+    let loadedCount = 0, missingCount = 0;
     const totalMain = mainModels.length;
 
     log(`Placing models... (0/${totalMain})`, 'scene', 'model-progress');
@@ -1681,11 +1823,13 @@ async function buildScene(config) {
             if (m.rotationY) procedural.rotation.y = m.rotationY;
             procedural.userData._keyword = m.keyword;
             if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
+            enableShadows(procedural);
             scene.add(procedural);
             sceneObjects.push(procedural);
             if (!isFill) {
                 loadedCount++;
                 log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+                currentRun?.detail('models', `${loadedCount} of ${totalMain} placed`);
             }
             return;
         }
@@ -1696,9 +1840,13 @@ async function buildScene(config) {
             if (loaded) loaded.userData._keyword = m.keyword;
             if (myPhIdx >= 0 && placeholders[myPhIdx]) scene.remove(placeholders[myPhIdx]);
             if (!isFill) {
-                loadedCount++;
+                if (loaded) loadedCount++; else missingCount++;
                 log(`Placing models... (${loadedCount}/${totalMain}) — ${m.keyword}`, 'scene', 'model-progress');
+                currentRun?.detail('models', `${loadedCount} of ${totalMain} placed`);
             }
+        } else if (!isFill) {
+            missingCount++;
+            log(`No model for "${m.keyword}"`, 'scene');
         }
     }
 
@@ -1710,63 +1858,295 @@ async function buildScene(config) {
     ];
     await Promise.all(loadPromises);
 
-    log(`All ${totalMain} models placed`, 'scene', 'model-progress');
+    log(`${loadedCount} of ${totalMain} models placed`, 'scene', 'model-progress');
 
     // Clean up remaining placeholders and stop animation
     if (phAnimId) cancelAnimationFrame(phAnimId);
     placeholders.forEach(ph => { if (ph.parent) scene.remove(ph); ph.geometry.dispose(); ph.material.dispose(); });
+    return { placed: loadedCount, missing: missingCount, total: totalMain };
 }
 
-// Console logging
-const LOG_ICONS = {
-    system: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2.5" fill="white"/></svg>`,
-    agent:  `<svg width="8" height="8" viewBox="0 0 8 8"><rect x="1" y="1" width="6" height="6" rx="1" fill="white"/></svg>`,
-    success:`<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1.5 4.5L3 6 6.5 2" stroke="white" stroke-width="1.3" fill="none"/></svg>`,
-    error:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 2l4 4M6 2l-4 4" stroke="white" stroke-width="1.3"/></svg>`,
-    motion: `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M2 1v6l5-3z" fill="white"/></svg>`,
-    scene:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6L4 2l3 4z" fill="white"/></svg>`,
-    render: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="2" fill="none" stroke="white" stroke-width="1.2"/><circle cx="4" cy="4" r="0.8" fill="white"/></svg>`,
-    path:   `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 6Q4 1 7 6" stroke="white" stroke-width="1.2" fill="none"/></svg>`,
-    user:   `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="2.5" r="1.5" fill="white"/><path d="M1.5 7a2.5 2.5 0 015 0" fill="white"/></svg>`,
-    music:  `<svg width="8" height="8" viewBox="0 0 8 8"><path d="M3 1v5M6 0v4.5" stroke="white" stroke-width="1.2"/><circle cx="2" cy="6" r="1.2" fill="white"/><circle cx="5" cy="5" r="1.2" fill="white"/></svg>`,
-};
+// ========== ACTIVITY: run tracker, GPU state, detail log ==========
+const PAGE_T0 = performance.now();
+function fmtSecs(ms) {
+    const sec = Math.max(0, ms) / 1000;
+    if (sec < 60) return sec.toFixed(1) + 's';
+    return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+}
+function h(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+}
 
+// Detail log: plain lines under the "Details" disclosure.
 function log(msg, type = 'system', id = null) {
-    const console_el = document.getElementById('console');
-
-    // If an id is provided, update existing line instead of creating new one
+    const list = document.getElementById('log-list');
     if (id) {
         const existing = document.getElementById('log-' + id);
-        if (existing) {
-            existing.querySelector('.log-msg').textContent = msg;
-            console_el.scrollTop = console_el.scrollHeight;
-            return existing;
-        }
+        if (existing) { existing.querySelector('.log-msg').textContent = msg; return existing; }
     }
-
-    const line = document.createElement('div');
-    line.className = `log-line log-${type}`;
+    const line = h('div', `log-line log-${type}`);
     if (id) line.id = 'log-' + id;
-
-    const icon = document.createElement('div');
-    icon.className = 'log-icon';
-    icon.innerHTML = LOG_ICONS[type] || LOG_ICONS.system;
-
-    const msgEl = document.createElement('span');
-    msgEl.className = 'log-msg';
-    msgEl.textContent = msg;
-
-    line.appendChild(icon);
-    line.appendChild(msgEl);
-    console_el.appendChild(line);
-    console_el.scrollTop = console_el.scrollHeight;
+    const sec = Math.floor((performance.now() - PAGE_T0) / 1000);
+    line.append(h('span', 'log-t', `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`), h('span', 'log-msg', msg));
+    list.appendChild(line);
+    while (list.children.length > 300) list.firstChild.remove();
     return line;
 }
 
-function setPill(id, active) {
-    const el = document.getElementById(id);
-    if (el) el.classList.toggle('active', active);
+function setPill() {} // legacy no-op
+
+// --- Motion server (GPU) state ---
+// /health only answers once the model is loaded, so a slow reply means a cold GPU.
+const gpu = { state: 'checking', since: performance.now(), info: null, lastOk: 0 };
+const COLD_START_NOTE = 'The motion model runs on a Modal L4 GPU that sleeps when idle. Waking it can take up to two minutes; after that a motion takes about 7 seconds.';
+
+function setGpu(state, info) {
+    if (state !== gpu.state) gpu.since = performance.now();
+    gpu.state = state;
+    if (info) gpu.info = info;
+    if (state === 'ready') gpu.lastOk = performance.now();
+    renderGpu();
 }
+
+function renderGpu() {
+    const secs = Math.floor((performance.now() - gpu.since) / 1000);
+    const name = gpu.info?.gpu || 'L4';
+    const pillText = {
+        checking: 'Connecting',
+        warming: `Warming up GPU ${secs}s`,
+        ready: `${name} GPU ready`,
+        offline: 'Motion server offline',
+    }[gpu.state];
+    const longText = {
+        checking: 'Connecting to the motion model',
+        warming: `The motion model is waking up on a Modal ${name} GPU (${secs}s). A cold start can take up to two minutes.`,
+        ready: `Motion model ready on a Modal ${name} GPU`,
+        offline: 'Motion server unreachable. Generation will fail until it is back.',
+    }[gpu.state];
+    const pill = document.getElementById('gpu-pill');
+    pill.dataset.state = gpu.state;
+    document.getElementById('gpu-text').textContent = pillText;
+    pill.title = gpu.state === 'offline' ? 'Retry' : longText;
+    const w = document.getElementById('w-status');
+    w.dataset.state = gpu.state;
+    document.getElementById('w-status-text').textContent = longText;
+}
+
+async function checkHealth() {
+    setGpu('checking');
+    const slow = setTimeout(() => { if (gpu.state === 'checking') setGpu('warming'); }, 2500);
+    try {
+        const res = await fetch(`${API}/health`);
+        if (!res.ok) throw new Error(`health ${res.status}`);
+        const info = await res.json();
+        setGpu('ready', info);
+        log(`Motion model ready: ${info.model} on Modal ${info.gpu}` , 'success');
+    } catch (e) {
+        if (gpu.state !== 'ready') setGpu('offline');
+        log('Motion server unreachable, generation will fail', 'error');
+    }
+    clearTimeout(slow);
+}
+document.getElementById('gpu-pill').addEventListener('click', () => { if (gpu.state === 'offline') checkHealth(); });
+
+// What the motion step says while it waits on the server.
+function motionWaitText() {
+    const idle = gpu.lastOk && performance.now() - gpu.lastOk > 290000; // Modal scales down after 300 s idle
+    if (gpu.state === 'ready' && !idle) return `Kimodo on a Modal ${gpu.info?.gpu || 'L4'} GPU`;
+    if (gpu.state === 'offline') return 'Trying the motion server';
+    return 'Waiting for the GPU to warm up, up to two minutes on a cold start';
+}
+function motionReceived() {
+    if (gpu.state !== 'ready') setGpu('ready');
+    else gpu.lastOk = performance.now();
+}
+
+// --- Runs: one per prompt, each a short list of honest steps ---
+const STEP_ICON = {
+    done: '<svg viewBox="0 0 10 10"><path d="M2.2 5.3l1.9 1.9L7.9 3.2" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    failed: '<svg viewBox="0 0 10 10"><path d="M3 3l4 4M7 3l-4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+};
+const runs = [];
+let currentRun = null;
+
+class Run {
+    constructor(title, steps, kind) {
+        this.title = title;
+        this.kind = kind;
+        this.t0 = performance.now();
+        this.t1 = null;
+        this.state = 'running';
+        this.summary = '';
+        this.steps = steps.map(([id, label]) => ({ id, label, state: 'pending', detail: '', t0: 0, t1: 0 }));
+        runs.push(this);
+        currentRun = this;
+        renderRuns();
+    }
+    step(id) { return this.steps.find(s => s.id === id); }
+    add(id, label) {
+        if (!this.step(id)) this.steps.push({ id, label, state: 'pending', detail: '', t0: 0, t1: 0 });
+        renderRuns();
+    }
+    start(id, detail = '') {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'active', detail, t0: performance.now() });
+        renderRuns();
+    }
+    detail(id, detail) {
+        const s = this.step(id); if (!s || s.detail === detail) return;
+        s.detail = detail;
+        renderRuns();
+    }
+    done(id, detail) {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'done', t1: performance.now() });
+        if (!s.t0) s.t0 = s.t1;
+        if (detail != null) s.detail = detail;
+        renderRuns();
+    }
+    fail(id, detail) {
+        const s = this.step(id); if (!s) return;
+        Object.assign(s, { state: 'failed', t1: performance.now(), detail });
+        if (!s.t0) s.t0 = s.t1;
+        renderRuns();
+    }
+    failActive(detail) {
+        const s = this.steps.find(x => x.state === 'active') || this.steps.find(x => x.state === 'pending');
+        if (s) this.fail(s.id, detail);
+    }
+    finish(summary = '') {
+        this.t1 = performance.now();
+        this.state = this.steps.some(s => s.state === 'failed') ? 'failed' : 'done';
+        this.summary = summary;
+        this.steps.forEach(s => { if (s.state === 'pending') s.state = 'skipped'; });
+        renderRuns();
+        if (this.kind === 'chat') {
+            clearTimeout(this._hide);
+            this._hide = setTimeout(() => { if (currentRun === this) renderPromptStatus(true); }, this.state === 'failed' ? 7000 : 2600);
+        }
+    }
+}
+
+function stepTime(s) {
+    if (s.state === 'active') return fmtSecs(performance.now() - s.t0);
+    if (s.state === 'done' || s.state === 'failed') return fmtSecs(s.t1 - s.t0);
+    return '';
+}
+function runMeta(r) {
+    if (r.state === 'running') return `Running ${fmtSecs(performance.now() - r.t0)}`;
+    if (r.state === 'failed') return `Failed after ${fmtSecs(r.t1 - r.t0)}`;
+    return `Done in ${fmtSecs(r.t1 - r.t0)}` + (r.summary ? ` · ${r.summary}` : '');
+}
+
+function buildSteps(run) {
+    const list = h('div', 'steps');
+    run.steps.forEach((s, i) => {
+        const row = h('div', `step ${s.state}`);
+        const icon = h('div', 'step-icon');
+        icon.innerHTML = STEP_ICON[s.state] || '';
+        const body = h('div', 'step-body');
+        body.append(h('div', 'step-label', s.label));
+        const det = h('div', 'step-detail', s.detail);
+        if (!s.detail) det.style.display = 'none';
+        det.dataset.detail = `${runs.indexOf(run)}:${i}`;
+        body.append(det);
+        const time = h('div', 'step-time', stepTime(s));
+        time.dataset.tick = `${runs.indexOf(run)}:${i}`;
+        row.append(icon, body, time);
+        list.append(row);
+    });
+    return list;
+}
+
+function renderRuns() {
+    const runsEl = document.getElementById('runs');
+    runsEl.replaceChildren();
+    const latest = runs[runs.length - 1];
+    if (latest) {
+        const card = h('div', 'run');
+        card.append(h('div', 'run-title', latest.title));
+        const meta = h('div', `run-meta ${latest.state}`, runMeta(latest));
+        meta.dataset.meta = String(runs.length - 1);
+        card.append(meta, buildSteps(latest));
+        runsEl.append(card);
+    }
+    const prev = runs.slice(0, -1).slice(-6).reverse();
+    if (prev.length) {
+        const hist = h('div', 'run-history');
+        for (const r of prev) {
+            const row = h('div', `run-prev ${r.state}`);
+            row.append(h('span', 'rp-dot'), h('span', 'rp-title', r.title), h('span', 'rp-time', r.t1 ? fmtSecs(r.t1 - r.t0) : ''));
+            row.title = r.title;
+            hist.append(row);
+        }
+        runsEl.append(hist);
+    }
+    const reopen = document.getElementById('panel-reopen');
+    reopen.dataset.state = latest ? latest.state : '';
+    renderGenOverlay();
+    renderPromptStatus();
+}
+
+// First-scene loading card in the middle of the viewport.
+let overlayRun = null;
+function renderGenOverlay() {
+    const ov = document.getElementById('gen-overlay');
+    if (!overlayRun) { ov.classList.remove('visible'); return; }
+    ov.classList.add('visible');
+    document.getElementById('go-prompt').textContent = overlayRun.title;
+    document.getElementById('go-steps').replaceChildren(buildSteps(overlayRun));
+    const failed = overlayRun.state === 'failed';
+    document.querySelector('.go-eyebrow').textContent = failed ? 'Generation failed' : 'Building your scene';
+    const m = overlayRun.step('motion');
+    const waitingOnGpu = m && m.state === 'active' && gpu.state !== 'ready';
+    document.getElementById('go-note').textContent = waitingOnGpu ? COLD_START_NOTE : '';
+    document.getElementById('go-actions').classList.toggle('visible', failed);
+}
+
+// One-line status above the prompt bar for follow-up requests.
+function renderPromptStatus(hide = false) {
+    const el = document.getElementById('prompt-status');
+    const r = currentRun;
+    if (hide || !r || r.kind !== 'chat') { el.classList.remove('visible', 'failed'); return; }
+    const active = r.steps.find(s => s.state === 'active');
+    const failedStep = r.steps.find(s => s.state === 'failed');
+    let text;
+    if (failedStep) text = `${failedStep.label} failed: ${failedStep.detail}`;
+    else if (active) text = active.detail ? `${active.label}: ${active.detail}` : `${active.label}...`;
+    else if (r.state === 'done') text = r.summary || 'Done';
+    else text = 'Working...';
+    el.replaceChildren();
+    if (r.state === 'running' || failedStep) el.append(h('span', 'ps-spin'));
+    el.append(h('span', 'ps-text', text));
+    if (r.state === 'running') { const t = h('span', 'ps-time', fmtSecs(performance.now() - r.t0)); t.dataset.psTime = '1'; el.append(t); }
+    el.classList.add('visible');
+    el.classList.toggle('failed', !!failedStep);
+}
+
+// Live clocks: update only the time text so spinners keep spinning.
+setInterval(() => {
+    if (gpu.state === 'warming') renderGpu();
+    const running = runs.some(r => r.state === 'running');
+    if (!running) return;
+    document.querySelectorAll('[data-tick]').forEach(el => {
+        const [ri, si] = el.dataset.tick.split(':').map(Number);
+        const s = runs[ri]?.steps[si];
+        if (s) el.textContent = stepTime(s);
+    });
+    document.querySelectorAll('[data-meta]').forEach(el => {
+        const r = runs[Number(el.dataset.meta)];
+        if (r) el.textContent = runMeta(r);
+    });
+    const ps = document.querySelector('[data-ps-time]');
+    if (ps && currentRun) ps.textContent = fmtSecs(performance.now() - currentRun.t0);
+    // Keep the motion step's wait message in step with the GPU state.
+    const r = currentRun;
+    const m = r && r.step('motion');
+    if (m && m.state === 'active' && !m.detail.startsWith('Take ')) r.detail('motion', motionWaitText());
+}, 200);
 
 // Generate
 const btn = document.getElementById('generate-btn');
@@ -1781,31 +2161,29 @@ async function generate() {
     const duration = 5; // Default duration for initial generation
 
     btn.disabled = true;
-    btn.textContent = 'Generating...';
     document.getElementById('welcome').classList.add('hidden');
-    document.getElementById('panel').classList.remove('collapsed');
+    setPanelOpen(false);
     document.getElementById('panel-reopen').classList.remove('visible');
 
-    const shimmer = document.createElement('div');
-    shimmer.className = 'shimmer';
-    viewport.appendChild(shimmer);
-
     log(`> "${prompt}"`, 'agent');
-    const startTime = Date.now();
+    const run = new Run(prompt, [['motion', 'Motion'], ['scene', 'Scene plan'], ['models', 'Models'], ['animate', 'Animation']], 'generate');
+    overlayRun = run;
+    renderGenOverlay();
 
     try {
         // === STEP 1: Generate motion FIRST to get character path ===
         // Silently enhance the motion prompt for better demo results.
         // Bias toward locomotion and exaggerated movement — never shown to user.
         const motionPrompt = enhanceMotionPrompt(prompt);
-
-        setPill('pill-motion', true);
+        run.start('motion', motionWaitText());
         log(`Generating motion (${duration}s)...`, 'motion');
 
         const MIN_TRAVEL_DIST = 50; // minimum distance between start and end
         const MAX_RETRIES = 3;
         let bvhText = null;
         let characterPath = null;
+        let clipSeconds = duration;
+        let travelDist = 0;
 
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             const motionStart = Date.now();
@@ -1816,17 +2194,19 @@ async function generate() {
             });
             if (!motionRes.ok) throw new Error(await motionError(motionRes));
             bvhText = await motionRes.text();
+            motionReceived();
 
             const motionElapsed = ((Date.now() - motionStart) / 1000).toFixed(1);
 
             // Check if character actually moved
-            const { path } = extractPathFromBVH(bvhText);
+            const { path, result } = extractPathFromBVH(bvhText);
             characterPath = path;
+            clipSeconds = result.clip.duration;
 
             if (path.length >= 2) {
                 const startPt = path[0];
                 const endPt = path[path.length - 1];
-                const travelDist = Math.sqrt(
+                travelDist = Math.sqrt(
                     (endPt[0] - startPt[0]) ** 2 + (endPt[2] - startPt[2]) ** 2
                 );
 
@@ -1834,32 +2214,37 @@ async function generate() {
                     log(`Motion received (${(bvhText.length / 1024).toFixed(0)}KB, ${motionElapsed}s)`, 'motion');
                     break;
                 }
+                log(`Take ${attempt + 1} only moved ${Math.round(travelDist)}cm, asking for another`, 'motion');
+                run.detail('motion', `Take ${attempt + 2} of ${MAX_RETRIES + 1}: the last one barely moved`);
             } else {
                 break;
             }
         }
 
-        setPill('pill-motion', false);
         log(`Extracted ${characterPath.length} waypoints`, 'path');
+        run.done('motion', `${clipSeconds.toFixed(1)} s clip, travels ${(travelDist / 100).toFixed(1)} m`);
 
         // === STEP 3: Plan scene AROUND the path ===
-        setPill('pill-scene', true);
+        run.start('scene', 'Gemini picks what belongs in the scene');
         log('Planning scene layout...', 'scene');
 
         const config = await callGemini(prompt, characterPath);
         config._characterPath = characterPath;
-        const geminiElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        config._prompt = prompt;
         const modelCount = (config.scene.models || []).length;
-        log(`Planned ${modelCount} models (${geminiElapsed}s)`, 'scene');
+        log(`Planned ${modelCount} models`, 'scene');
+        run.done('scene', `${modelCount} objects, ${config.scene.type || 'outdoor'}`);
 
         // === STEP 4: Build scene + load animation ===
-        await buildScene(config);
+        run.start('models', 'Loading models');
+        const stats = await buildScene(config);
         log('Scene built', 'scene');
-        setPill('pill-scene', false);
+        run.done('models', `${stats.placed} placed` + (stats.missing ? `, ${stats.missing} not in the library` : ''));
 
-        setPill('pill-render', true);
+        run.start('animate', 'Putting the motion on the character');
         log('Loading animation...', 'render');
         await loadBVH(bvhText);
+        prepareCharacter();
         lastBvhText = bvhText;
 
         // Build path visualization and apply terrain
@@ -1870,22 +2255,30 @@ async function generate() {
         const pathBtn = document.getElementById('path-toggle');
         pathBtn.style.display = '';
         pathBtn.classList.remove('active');
-        pathBtn.textContent = 'Show Path';
+        pathBtn.textContent = 'Show path';
 
         // Initialize timeline with first clip
         timelineClips = [{ prompt: prompt, duration: currentClip.duration, clip: currentClip }];
         totalDuration = currentClip.duration;
         renderTimelineClips();
         showTimeline();
-        document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+        setPlayIcon(true);
         isPlaying = true;
 
         log('Scene complete', 'render');
+        cam.active = true;
+        controls.autoRotate = false;
+        frameCharacter(true);
         showEditor();
-        setPill('pill-render', false);
+        showPromptDock();
+        run.done('animate', 'Playing');
+        run.finish(`${stats.placed} models`);
 
-        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        log(`Total generation time: ${totalElapsed}s`, 'system');
+        log(`Total generation time: ${fmtSecs(run.t1 - run.t0)}`, 'system');
+        overlayRun = null;
+        renderGenOverlay();
+        // Desktop keeps the tracker in view; phones keep the scene clear.
+        setPanelOpen(window.innerWidth > 860);
 
         // Generate soundtrack in background (non-blocking)
         // Music disabled during live playback — only plays during video render
@@ -1893,16 +2286,22 @@ async function generate() {
 
     } catch (err) {
         log(`Error: ${err.message}`, 'error');
-        setPill('pill-scene', false);
-        setPill('pill-motion', false);
-        setPill('pill-render', false);
+        run.failActive(err.message);
+        run.finish();
     }
 
-    shimmer.remove();
     btn.disabled = false;
-    btn.textContent = 'Generate';
     isGenerating = false;
 }
+
+// Failed first scene: try the same prompt again, or go back to the start.
+document.getElementById('go-retry').addEventListener('click', () => { overlayRun = null; generate(); });
+document.getElementById('go-back').addEventListener('click', () => {
+    overlayRun = null;
+    renderGenOverlay();
+    if (currentClip) setPanelOpen(window.innerWidth > 860);
+    else showWelcome();
+});
 
 btn.addEventListener('click', generate);
 input.addEventListener('keydown', e => {
@@ -1910,11 +2309,12 @@ input.addEventListener('keydown', e => {
 });
 
 // Welcome screen
-document.getElementById('logo-btn').addEventListener('click', () => {
+function showWelcome() {
     document.getElementById('welcome').classList.remove('hidden');
     document.getElementById('welcome-input').value = '';
     document.getElementById('welcome-input').focus();
-});
+}
+document.getElementById('logo-btn').addEventListener('click', () => { if (!isGenerating) showWelcome(); });
 
 function dismissWelcome(prompt) {
     input.value = prompt;
@@ -1928,9 +2328,15 @@ document.querySelectorAll('.w-ex').forEach(card => {
 
 const welcomeInputEl = document.getElementById('welcome-input');
 const welcomeArrow = document.querySelector('.w-input-arrow');
-if (welcomeArrow) welcomeInputEl.addEventListener('input', () => {
-    welcomeArrow.classList.toggle('visible', welcomeInputEl.value.trim().length > 0);
-});
+if (welcomeArrow) {
+    welcomeInputEl.addEventListener('input', () => {
+        welcomeArrow.classList.toggle('visible', welcomeInputEl.value.trim().length > 0);
+    });
+    welcomeArrow.addEventListener('click', () => {
+        const v = welcomeInputEl.value.trim();
+        if (v) dismissWelcome(v);
+    });
+}
 welcomeInputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
         const v = e.target.value.trim();
@@ -1940,10 +2346,215 @@ welcomeInputEl.addEventListener('keydown', (e) => {
 
 // Render loop
 const _charWorldPos = new THREE.Vector3();
-let _userOrbiting = false;
-let _orbitTimeout = null;
-controls.addEventListener('start', () => { _userOrbiting = true; clearTimeout(_orbitTimeout); });
-controls.addEventListener('end', () => { _orbitTimeout = setTimeout(() => { _userOrbiting = false; }, 2000); });
+
+// ========== CAMERA: frame the character, follow it, see past models ==========
+const cam = {
+    active: false,     // follow once a character exists
+    locked: false,     // render capture drives the camera itself
+    interacting: false,
+    userMoved: false,
+    focusY: 95,
+    lastCheck: 0,
+    boxes: [], boxStamp: -1, boxTime: 0,
+    fading: new Set(),
+    tween: null,
+    vel: new THREE.Vector3(), prevHips: null,
+};
+const _camFocus = new THREE.Vector3(), _camStep = new THREE.Vector3();
+const _segRay = new THREE.Ray(), _segHit = new THREE.Vector3(), _segDir = new THREE.Vector3();
+const FADED_OPACITY = 0.16;
+
+controls.addEventListener('start', () => {
+    cam.interacting = true;
+    cam.userMoved = true;
+    cam.tween = null;
+});
+controls.addEventListener('end', () => { cam.interacting = false; });
+
+// World boxes of placed models, refreshed when the scene changes.
+function modelBoxes() {
+    const now = performance.now();
+    if (cam.boxStamp !== sceneObjects.length || now - cam.boxTime > 2000) {
+        cam.boxes = [];
+        for (const o of sceneObjects) {
+            if (o.userData._isGround || o.isLight || !o.visible) continue;
+            const box = new THREE.Box3().setFromObject(o);
+            if (!box.isEmpty()) cam.boxes.push({ obj: o, box });
+        }
+        cam.boxStamp = sceneObjects.length;
+        cam.boxTime = now;
+    }
+    return cam.boxes;
+}
+
+// Models that sit between the camera and the character's head, hips or feet,
+// or that the camera is inside.
+function blockersBetween(camPos, focus) {
+    const pts = [
+        focus,
+        new THREE.Vector3(focus.x, 15, focus.z),
+        new THREE.Vector3(focus.x, focus.y + 75, focus.z),
+    ];
+    const out = [];
+    for (const { obj, box } of modelBoxes()) {
+        if (obj === selectedObject) continue;
+        if (box.distanceToPoint(camPos) < 25) { out.push(obj); continue; } // the camera is (nearly) inside it
+        for (const p of pts) {
+            if (box.containsPoint(p)) continue; // character is inside this box (under a canopy)
+            const len = camPos.distanceTo(p);
+            _segRay.set(camPos, _segDir.subVectors(p, camPos).normalize());
+            if (_segRay.intersectBox(box, _segHit) && camPos.distanceTo(_segHit) < len - 20) { out.push(obj); break; }
+        }
+    }
+    return out;
+}
+
+function setFaded(obj, faded) {
+    if (!!obj.userData._fadeTarget === faded && (faded || !cam.fading.has(obj))) return;
+    obj.userData._fadeTarget = faded;
+    obj.traverse(c => {
+        if (!c.isMesh || Array.isArray(c.material)) return;
+        if (!c.userData._fadeMat) {
+            c.userData._origMat = c.material;
+            const m = c.material.clone();
+            m.transparent = true;
+            m.opacity = 1;
+            c.userData._fadeMat = m;
+        }
+        c.material = c.userData._fadeMat;
+    });
+    cam.fading.add(obj);
+}
+
+// Ease faded models toward their target opacity, restoring the original
+// material once a model is fully visible again.
+function updateFades(dt) {
+    const k = 1 - Math.exp(-dt * 8);
+    for (const obj of cam.fading) {
+        const target = obj.userData._fadeTarget ? FADED_OPACITY : 1;
+        let done = true;
+        obj.traverse(c => {
+            const m = c.userData && c.userData._fadeMat;
+            if (!m || c.material !== m) return;
+            m.opacity += (target - m.opacity) * k;
+            if (Math.abs(target - m.opacity) > 0.01) done = false;
+            else m.opacity = target;
+        });
+        if (done && target === 1) {
+            obj.traverse(c => { if (c.userData && c.userData._origMat && c.material === c.userData._fadeMat) c.material = c.userData._origMat; });
+            cam.fading.delete(obj);
+        }
+    }
+}
+
+function clearFades() {
+    for (const obj of cam.fading) {
+        obj.traverse(c => { if (c.userData && c.userData._origMat) c.material = c.userData._origMat; });
+        obj.userData._fadeTarget = false;
+    }
+    cam.fading.clear();
+}
+
+// Pick a front three-quarter view of the character with the fewest models in the way.
+function frameCharacter(animateIt = true) {
+    if (!characterAnchor(_camFocus)) return;
+    const focus = _camFocus.clone();
+    focus.y = cam.focusY = THREE.MathUtils.clamp(focus.y * 0.92, 50, 140);
+
+    // Orient on the direction of travel so the walk reads from the front-side.
+    let heading = 0;
+    if (currentClip) {
+        const p = extractPathFromClip(currentClip);
+        const a = p[0], b = p[p.length - 1];
+        if (a && b && Math.hypot(b[0] - a[0], b[2] - a[2]) > 20) heading = Math.atan2(b[0] - a[0], b[2] - a[2]);
+    }
+    const dist = IS_SMALL ? 600 : 470;
+    let best = null;
+    // Low angles first; climb only when every low view is blocked.
+    // Big blockers (buildings) cost more than small ones (bushes).
+    search:
+    for (const [pitch, cost] of [[0.26, 0], [0.45, 4], [0.68, 9]]) {
+        for (let i = 0; i < 18; i++) {
+            const step = i === 0 ? 0 : (i % 2 ? 1 : -1) * Math.ceil(i / 2) * (Math.PI / 9);
+            const az = heading + 0.95 + step;
+            const offset = new THREE.Vector3(Math.sin(az) * Math.cos(pitch), Math.sin(pitch), Math.cos(az) * Math.cos(pitch)).multiplyScalar(dist);
+            let weight = 0;
+            for (const o of blockersBetween(focus.clone().add(offset), focus)) {
+                const box = cam.boxes.find(b => b.obj === o)?.box;
+                weight += box ? THREE.MathUtils.clamp((box.max.y - box.min.y) / 80, 1, 6) : 1;
+            }
+            const score = weight * 10 + Math.abs(step) + cost;
+            if (!best || score < best.score) best = { offset, score };
+            if (weight === 0) break search;
+        }
+    }
+    cam.userMoved = false;
+    if (animateIt) {
+        cam.tween = { t: 0, dur: 1.2, fromPos: camera.position.clone(), fromTarget: controls.target.clone(), offset: best.offset };
+    } else {
+        controls.target.copy(focus);
+        camera.position.copy(focus).add(best.offset);
+        controls.update();
+    }
+}
+
+function updateCamera(dt) {
+    const hasChar = cam.active && !cam.locked && characterAnchor(_camFocus);
+    if (hasChar) {
+        // Lead by the smoothed ground velocity so a fast walker stays centered.
+        if (cam.prevHips && dt > 0) {
+            _camStep.subVectors(_camFocus, cam.prevHips).divideScalar(dt);
+            _camStep.y = 0;
+            if (_camStep.lengthSq() > 1500 * 1500) cam.vel.set(0, 0, 0); // loop jump
+            else cam.vel.lerp(_camStep, 1 - Math.exp(-dt * 2));
+        }
+        cam.prevHips = (cam.prevHips || new THREE.Vector3()).copy(_camFocus);
+        _camFocus.addScaledVector(cam.vel, 0.2);
+        const ty = THREE.MathUtils.clamp(cam.prevHips.y * 0.92, 50, 140);
+        cam.focusY += (ty - cam.focusY) * (1 - Math.exp(-dt * 1.5));
+        _camFocus.y = cam.focusY;
+    }
+    if (cam.tween) {
+        // Ease from wherever the camera was onto the live character position.
+        const tw = cam.tween;
+        tw.t = Math.min(tw.t + dt / tw.dur, 1);
+        const e = tw.t < 0.5 ? 4 * tw.t ** 3 : 1 - (-2 * tw.t + 2) ** 3 / 2;
+        const goal = hasChar ? _camFocus : tw.fromTarget;
+        controls.target.lerpVectors(tw.fromTarget, goal, e);
+        _camStep.copy(goal).add(tw.offset);
+        camera.position.lerpVectors(tw.fromPos, _camStep, e);
+        if (tw.t >= 1) cam.tween = null;
+        camera.lookAt(controls.target);
+    } else if (hasChar) {
+        _camStep.subVectors(_camFocus, controls.target);
+        // A big jump means the clip looped back to its start: cut, don't swoop.
+        if (_camStep.lengthSq() > 250 * 250) _camStep.multiplyScalar(1);
+        else _camStep.multiplyScalar(1 - Math.exp(-dt * 5));
+        controls.target.add(_camStep);
+        camera.position.add(_camStep);
+        controls.update();
+    } else {
+        controls.update();
+    }
+
+    if (hasChar && !cam.tween) fadeBlockers(_camFocus);
+    updateFades(dt);
+}
+
+// Ghost whatever stands between the camera and the character (10 checks a second).
+const _fadeFocus = new THREE.Vector3();
+function fadeBlockers(focus) {
+    const now = performance.now();
+    if (now - cam.lastCheck < 100) return;
+    cam.lastCheck = now;
+    if (!focus) {
+        if (!characterAnchor(_fadeFocus)) return;
+        focus = _fadeFocus;
+    }
+    const blocking = new Set(blockersBetween(camera.position, focus));
+    for (const { obj } of cam.boxes) setFaded(obj, blocking.has(obj));
+}
+
 let isRecording = false;
 let selectedClipIndex = -1;
 function animate() {
@@ -1951,6 +2562,7 @@ function animate() {
     const dt = clock.getDelta();
     if (isRecording) return;
     if (mixer && isPlaying) mixer.update(dt);
+    updateCamera(Math.min(dt, 0.1));
     if (!skinnedCharMesh) updateBodyMeshes(); // capsule fallback only
     if (timelineClips.length > 0) updatePlayhead();
     // Keep ground centered on character
@@ -1974,13 +2586,39 @@ function animate() {
         const pulse = 0.6 + Math.sin(Date.now() * 0.004) * 0.4;
         selectionBox.material.opacity = pulse;
     }
+    updateEnvironmentFollow();
+    if (welcomeOpen()) return; // fully covered; save the GPU for the preview
     renderer.render(scene, camera);
+}
+const _welcomeEl = document.getElementById('welcome');
+function welcomeOpen() { return !_welcomeEl.classList.contains('hidden'); }
+
+// Sun, shadow frustum, sky and contact shadow track the character.
+const _envFocus = new THREE.Vector3();
+function updateEnvironmentFollow() {
+    if (characterAnchor(_envFocus)) {
+        contactShadow.position.x = _envFocus.x;
+        contactShadow.position.z = _envFocus.z;
+        // Fade the blob as the hips rise (jumps, flips)
+        const lift = Math.max(0, _envFocus.y - 95);
+        contactShadow.material.opacity = 0.6 * Math.max(0.25, 1 - lift / 120);
+    } else {
+        _envFocus.copy(controls.target);
+    }
+    _envFocus.y = 0;
+    sun.target.position.copy(_envFocus);
+    sun.position.copy(_envFocus).add(SUN_OFFSET);
+    sky.position.copy(camera.position);
+}
+
+// Shadows on whatever character meshes exist after a BVH load.
+function prepareCharacter() {
+    if (characterGroup) enableShadows(characterGroup);
+    bodyMeshes.forEach(m => { m.castShadow = true; m.receiveShadow = true; });
+    contactShadow.visible = !!currentBones;
 }
 animate();
 
-// Initial welcome messages
-log('Kinetik v0.1', 'system');
-log('Type a prompt or pick a scene to start', 'system');
 
 async function motionError(res) {
     try {
@@ -1992,15 +2630,8 @@ async function motionError(res) {
 
 // Report what the motion server actually says instead of assuming it is up.
 // This also warms a GPU container while the user is still typing.
-(async () => {
-    try {
-        const res = await fetch(`${API}/health`);
-        const h = await res.json();
-        log(`Motion model ready: ${h.model} on Modal ${h.gpu}`, 'success');
-    } catch {
-        log('Motion server unreachable, generation will fail', 'error');
-    }
-})();
+renderGpu();
+checkHealth();
 
 // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
 const WELCOME_MOTIONS = [
@@ -2017,35 +2648,71 @@ let welcomeInterval = null;
     const container = document.getElementById('w-preview');
     if (!container) return;
 
-    // Separate scene, camera, renderer for the preview box
+    // Separate scene, camera, renderer for the preview box.
+    // Transparent canvas: the card's CSS gradient is the backdrop.
     const wScene = new THREE.Scene();
-    wScene.background = new THREE.Color(0xe8e4f0);
 
-    const wCamera = new THREE.PerspectiveCamera(50, 480 / 520, 1, 2000);
-    wCamera.position.set(0, 120, 300);
-    wCamera.lookAt(0, 80, 0);
+    const wCamera = new THREE.PerspectiveCamera(42, 460 / 520, 1, 2000);
+    wCamera.position.set(0, 125, 330);
+    wCamera.lookAt(0, 82, 0);
 
     const wRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    wRenderer.setSize(480, 520);
-    wRenderer.setPixelRatio(window.devicePixelRatio);
+    wRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    wRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    wRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    wRenderer.toneMappingExposure = 1.05;
+    wRenderer.shadowMap.enabled = true;
+    wRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
     container.appendChild(wRenderer.domElement);
 
-    // Lights
-    wScene.add(new THREE.AmbientLight(0x606080, 2));
-    const wKey = new THREE.DirectionalLight(0xffffff, 2);
-    wKey.position.set(100, 200, 150);
-    wScene.add(wKey);
-    const wFill = new THREE.DirectionalLight(0x8888ff, 0.6);
-    wFill.position.set(-100, 100, -50);
-    wScene.add(wFill);
+    // Fit the canvas to the card (it changes size on phones).
+    function wResize() {
+        const w = container.clientWidth || 460, hgt = container.clientHeight || 520;
+        wRenderer.setSize(w, hgt, false);
+        wCamera.aspect = w / hgt;
+        // Narrow cards pull the camera back so a backflip still fits.
+        wCamera.position.z = 330 * Math.max(1, 0.9 / wCamera.aspect);
+        wCamera.updateProjectionMatrix();
+    }
+    wResize();
+    if (window.ResizeObserver) new ResizeObserver(wResize).observe(container);
 
-    // Simple floor disc
-    const floorGeo = new THREE.CircleGeometry(150, 32);
-    const floorMat = new THREE.MeshStandardMaterial({ color: 0xd4d0dc, roughness: 0.9 });
-    const floor = new THREE.Mesh(floorGeo, floorMat);
+    // Lights: soft sky light plus a warm key that casts the floor shadow
+    wScene.add(new THREE.HemisphereLight(0xf6f3fb, 0x9a90a8, 1.9));
+    const wKey = new THREE.DirectionalLight(0xfff3e6, 2.6);
+    wKey.position.set(120, 280, 180);
+    wKey.castShadow = true;
+    wKey.shadow.mapSize.set(1024, 1024);
+    Object.assign(wKey.shadow.camera, { left: -160, right: 160, top: 160, bottom: -160, near: 50, far: 700 });
+    wKey.shadow.normalBias = 0.6;
+    wScene.add(wKey);
+    const wRim = new THREE.DirectionalLight(0xc9b8f0, 0.9);
+    wRim.position.set(-160, 140, -200);
+    wScene.add(wRim);
+
+    // Floor: a soft lavender pool plus a shadow-only plane, no hard disc edge
+    const poolCanvas = document.createElement('canvas');
+    poolCanvas.width = poolCanvas.height = 256;
+    const pg = poolCanvas.getContext('2d');
+    const grad = pg.createRadialGradient(128, 128, 0, 128, 128, 128);
+    grad.addColorStop(0, 'rgba(124,92,191,0.16)');
+    grad.addColorStop(0.6, 'rgba(124,92,191,0.06)');
+    grad.addColorStop(1, 'rgba(124,92,191,0)');
+    pg.fillStyle = grad;
+    pg.fillRect(0, 0, 256, 256);
+    const poolTex = new THREE.CanvasTexture(poolCanvas);
+    poolTex.colorSpace = THREE.SRGBColorSpace;
+    const floor = new THREE.Mesh(
+        new THREE.PlaneGeometry(420, 420),
+        new THREE.MeshBasicMaterial({ map: poolTex, transparent: true, depthWrite: false, toneMapped: false })
+    );
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = 0;
     wScene.add(floor);
+    const shadowFloor = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.ShadowMaterial({ opacity: 0.16 }));
+    shadowFloor.rotation.x = -Math.PI / 2;
+    shadowFloor.position.y = 0.2;
+    shadowFloor.receiveShadow = true;
+    wScene.add(shadowFloor);
 
     // State
     let wMixer = null;
@@ -2198,21 +2865,25 @@ let welcomeInterval = null;
         }
     }
 
-    // Render loop for preview
-    let wAnimId = null;
+    // Render loop for preview; it idles while the welcome screen is hidden
+    // so the logo can bring it back.
+    const welcomeEl = document.getElementById('welcome');
     function wAnimate() {
-        wAnimId = requestAnimationFrame(wAnimate);
-        if (wMixer) wMixer.update(wClock.getDelta());
+        requestAnimationFrame(wAnimate);
+        const dt = wClock.getDelta();
+        if (welcomeEl.classList.contains('hidden')) return;
+        if (wMixer) wMixer.update(dt);
         wUpdateBodyMeshes();
         wRenderer.render(wScene, wCamera);
     }
     wAnimate();
 
+    const castAll = () => wBodyMeshes.forEach(m => { m.castShadow = true; });
+
     // Schedule next motion when current clip ends
     async function playNextWelcomeMotion() {
-        if (document.getElementById('welcome').classList.contains('hidden')) {
-            if (wAnimId) cancelAnimationFrame(wAnimId);
-            wRenderer.dispose();
+        if (welcomeEl.classList.contains('hidden')) {
+            setTimeout(playNextWelcomeMotion, 1000);
             return;
         }
         welcomeMotionIdx = (welcomeMotionIdx + 1) % WELCOME_MOTIONS.length;
@@ -2221,6 +2892,7 @@ let welcomeInterval = null;
             const r = await fetch(m.file);
             if (r.ok) {
                 const dur = await wLoadBVH(await r.text());
+                castAll();
                 // Mirror on X if flagged
                 if (wGroup) wGroup.scale.x = m.mirror ? -1 : 1;
                 const label = document.getElementById('w-motion-label');
@@ -2240,6 +2912,7 @@ let welcomeInterval = null;
             if (text) {
                 try {
                     const dur = await wLoadBVH(text);
+                    castAll();
                     setTimeout(playNextWelcomeMotion, Math.max(dur - 0.5, 1) * 1000);
                 } catch(e) { console.error('Welcome BVH parse error:', e); }
             }
@@ -2250,6 +2923,7 @@ let welcomeInterval = null;
 
 // Resize
 window.addEventListener('resize', () => {
+    if (timelineClips.length) renderTimelineRuler();
     camera.aspect = viewport.clientWidth / viewport.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(viewport.clientWidth, viewport.clientHeight);
@@ -2338,10 +3012,15 @@ function mergeClips(clipA, clipB, blendTime) {
     return new THREE.AnimationClip('merged', clipA.duration + clipB.duration, mergedTracks);
 }
 
+function setPlayIcon(playing) {
+    document.getElementById('tl-playpause').innerHTML = playing ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+}
+
 function showTimeline() {
     document.getElementById('timeline-bar').classList.add('visible');
 }
 
+// Clip blocks share the track in proportion to their length.
 function renderTimelineClips() {
     const container = document.getElementById('timeline-clips');
     container.innerHTML = '';
@@ -2349,26 +3028,78 @@ function renderTimelineClips() {
         const el = document.createElement('div');
         el.className = 'timeline-clip';
         if (i === selectedClipIndex) el.classList.add('selected');
-        const w = Math.max(80, seg.duration * 40);
-        el.style.width = w + 'px';
-        el.innerHTML = `<span>${seg.prompt}</span><span class="clip-dur">${seg.duration.toFixed(1)}s</span>`;
+        el.style.flex = `${seg.duration} 1 0`;
+        el.title = `${seg.prompt} (${seg.duration.toFixed(1)}s)`;
+        el.append(h('span', 'clip-name', seg.prompt), h('span', 'clip-dur', seg.duration.toFixed(1) + 's'));
         el.addEventListener('click', (e) => {
             e.stopPropagation();
-            // Toggle selection
-            if (selectedClipIndex === i) {
-                selectedClipIndex = -1;
-            } else {
-                selectedClipIndex = i;
-            }
+            if (tl.dragged) return; // that was a scrub, not a click
+            selectedClipIndex = selectedClipIndex === i ? -1 : i;
             renderTimelineClips();
-            // Seek to start of this clip
-            let t = 0;
-            for (let j = 0; j < i; j++) t += timelineClips[j].duration;
-            if (mixer) { mixer.setTime(t); updateBodyMeshes(); }
         });
         container.appendChild(el);
     });
+    tl.activeIdx = -1;
+    requestAnimationFrame(renderTimelineRuler);
 }
+
+// Time ruler with a tick spacing that fits the track width.
+function renderTimelineRuler() {
+    const ruler = document.getElementById('timeline-ruler');
+    const width = document.getElementById('timeline-clips').clientWidth;
+    tl.width = width;
+    ruler.replaceChildren();
+    if (!totalDuration || !width) return;
+    const step = [0.5, 1, 2, 5, 10, 20].find(st => (width / (totalDuration / st)) >= 90) || 30;
+    for (let t = 0; t <= totalDuration - step * 0.35; t += step) {
+        const tick = h('div', 'tl-tick', `${+t.toFixed(1)}s`);
+        tick.style.left = `${(t / totalDuration) * 100}%`;
+        ruler.append(tick);
+    }
+}
+
+// Timeline scrub state; times are clip seconds (the mixer runs them at timeScale).
+const tl = { width: 0, activeIdx: -1, dragging: false, dragged: false, wasPlaying: true, startX: 0, lastLabel: '' };
+
+function seekTimeline(t) {
+    if (!mixer || !totalDuration) return;
+    t = THREE.MathUtils.clamp(t, 0, totalDuration - 1e-3);
+    mixer.setTime(t / (mixer.timeScale || 1));
+}
+
+(() => {
+    const track = document.getElementById('timeline-track');
+    const timeAt = (e) => {
+        const r = document.getElementById('timeline-clips').getBoundingClientRect();
+        return ((e.clientX - r.left) / r.width) * totalDuration;
+    };
+    track.addEventListener('pointerdown', (e) => {
+        if (!mixer || !totalDuration) return;
+        tl.dragging = true;
+        tl.dragged = false;
+        tl.startX = e.clientX;
+        tl.wasPlaying = isPlaying;
+        isPlaying = false;
+        isScrubbing = true;
+        track.setPointerCapture(e.pointerId);
+        seekTimeline(timeAt(e));
+    });
+    track.addEventListener('pointermove', (e) => {
+        if (!tl.dragging) return;
+        if (Math.abs(e.clientX - tl.startX) > 4) tl.dragged = true;
+        seekTimeline(timeAt(e));
+    });
+    const end = () => {
+        if (!tl.dragging) return;
+        tl.dragging = false;
+        isScrubbing = false;
+        isPlaying = tl.wasPlaying;
+        setPlayIcon(isPlaying);
+        setTimeout(() => { tl.dragged = false; }, 0);
+    };
+    track.addEventListener('pointerup', end);
+    track.addEventListener('pointercancel', end);
+})();
 
 // Rebuild merged clip from all timeline segments
 function rebuildMergedClip() {
@@ -2391,29 +3122,25 @@ function updatePlayhead() {
     if (!mixer || totalDuration === 0) return;
     // Loop the merged clip
     const t = mixer.time % totalDuration;
-    const clipsEl = document.getElementById('timeline-clips');
-    const controlsEl = document.getElementById('timeline-controls');
-    // Calculate total width of just the clip blocks (not the add input)
-    let clipsWidth = 0;
-    clipsEl.querySelectorAll('.timeline-clip').forEach(el => { clipsWidth += el.offsetWidth + 4; });
-    clipsWidth = Math.max(clipsWidth, 1);
-    const offset = controlsEl.offsetWidth + 16;
-    const frac = Math.min(t / totalDuration, 1.0); // clamp to 0-1
-    const px = offset + frac * clipsWidth;
-    document.getElementById('timeline-playhead').style.left = px + 'px';
-    document.getElementById('tl-time').textContent = t.toFixed(1) + 's';
+    if (!tl.width) tl.width = document.getElementById('timeline-clips').clientWidth;
+    const frac = Math.min(t / totalDuration, 1);
+    document.getElementById('timeline-playhead').style.transform = `translateX(${(frac * tl.width).toFixed(1)}px)`;
+    const label = `${t.toFixed(1)}s`;
+    if (label !== tl.lastLabel) {
+        tl.lastLabel = label;
+        document.getElementById('tl-time').innerHTML = `${label} <span class="tl-total">/ ${totalDuration.toFixed(1)}s</span>`;
+    }
 
     // Highlight active clip
-    let elapsed = 0;
-    document.querySelectorAll('.timeline-clip').forEach((el, i) => {
-        const seg = timelineClips[i];
-        if (seg && t >= elapsed && t < elapsed + seg.duration) {
-            el.classList.add('active');
-        } else {
-            el.classList.remove('active');
-        }
-        if (seg) elapsed += seg.duration;
-    });
+    let elapsed = 0, idx = -1;
+    for (let i = 0; i < timelineClips.length; i++) {
+        if (t >= elapsed && t < elapsed + timelineClips[i].duration) { idx = i; break; }
+        elapsed += timelineClips[i].duration;
+    }
+    if (idx !== tl.activeIdx) {
+        tl.activeIdx = idx;
+        document.querySelectorAll('.timeline-clip').forEach((el, i) => el.classList.toggle('active', i === idx));
+    }
 }
 
 // Click to select/delete scene objects (silent — no panel)
@@ -2486,7 +3213,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === ' ') {
         e.preventDefault();
         isPlaying = !isPlaying;
-        document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+        setPlayIcon(isPlaying);
         return;
     }
 
@@ -2519,7 +3246,7 @@ document.addEventListener('keydown', (e) => {
 // Play/Pause button
 document.getElementById('tl-playpause').addEventListener('click', () => {
     isPlaying = !isPlaying;
-    document.getElementById('tl-playpause').innerHTML = isPlaying ? '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>' : '<svg width="10" height="12" viewBox="0 0 10 12"><path d="M1 0.5v11l8.5-5.5z" fill="currentColor"/></svg>';
+    setPlayIcon(isPlaying);
 });
 
 // Deselect timeline clip when clicking outside
@@ -2541,7 +3268,7 @@ function findNearestObject(keyword) {
     let best = null, bestDist = Infinity;
     // Get character's current position
     const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
+    characterAnchor(charPos);
     for (const obj of sceneObjects) {
         if (obj.userData._isGround) continue;
         const objKw = (obj.userData._keyword || '').toLowerCase();
@@ -2608,9 +3335,9 @@ async function classifyChat(userMsg) {
             generationConfig: { temperature: 0.2 }
         })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Empty classification response');
+    if (!text) throw new Error(geminiProblem(res, data));
     const clean = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     return JSON.parse(clean);
 }
@@ -2618,7 +3345,7 @@ async function classifyChat(userMsg) {
 // Resolve a direction string to [x, z] coordinates
 function resolveDirection(direction, scale = 400) {
     const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
+    characterAnchor(charPos);
     const cx = charPos.x, cz = charPos.z;
 
     if (direction.startsWith('near ')) {
@@ -2653,15 +3380,20 @@ async function handleAddObject(params) {
     const targetScale = sizeScales[params.size] || 100;
 
     log(`Adding "${params.keyword}" (${params.direction || 'random'})...`, 'scene', 'chat-action');
+    const run = currentRun;
+    run?.add('place', 'Place object');
+    run?.start('place', `${params.keyword}, ${params.direction || 'anywhere'}`);
 
     // Try procedural first
     const procedural = tryProceduralModel(params.keyword, targetScale);
     if (procedural) {
         procedural.position.set(x, 0, z);
         procedural.userData._keyword = params.keyword;
+        enableShadows(procedural);
         scene.add(procedural);
         sceneObjects.push(procedural);
         log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+        run?.done('place', `Placed ${params.keyword}`);
         return;
     }
 
@@ -2670,9 +3402,16 @@ async function handleAddObject(params) {
     if (glbUrl) {
         const loaded = await loadGLBModel(glbUrl, position, targetScale, Math.random() * Math.PI * 2);
         if (loaded) loaded.userData._keyword = params.keyword;
-        log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+        if (loaded) {
+            log(`Placed "${params.keyword}" to the ${params.direction || 'scene'}`, 'success', 'chat-action');
+            run?.done('place', `Placed ${params.keyword}`);
+        } else {
+            log(`Could not load "${params.keyword}" model`, 'error', 'chat-action');
+            run?.fail('place', `Could not load the ${params.keyword} model`);
+        }
     } else {
         log(`Could not find "${params.keyword}" model`, 'error', 'chat-action');
+        run?.fail('place', `No ${params.keyword} in the model library`);
     }
 }
 
@@ -2686,7 +3425,7 @@ async function handleAddMotion(params) {
         const target = findNearestObject(params.target_object);
         if (target) {
             const charPos = new THREE.Vector3();
-            if (currentBones) currentBones.getWorldPosition(charPos);
+            characterAnchor(charPos);
             targetAngle = Math.atan2(
                 target.position.x - charPos.x,
                 target.position.z - charPos.z
@@ -2698,7 +3437,10 @@ async function handleAddMotion(params) {
     }
 
     log(`Generating motion (${dur}s)...`, 'motion', 'chat-action');
-    setPill('pill-motion', true);
+    const run = currentRun;
+    run?.add('motion', 'Motion');
+    run?.add('blend', 'Timeline');
+    run?.start('motion', motionWaitText());
 
     try {
         const res = await fetch(`${API}/generate-motion`, {
@@ -2707,6 +3449,9 @@ async function handleAddMotion(params) {
         });
         if (!res.ok) throw new Error(await motionError(res));
         const bvh = await res.text();
+        motionReceived();
+        run?.done('motion', `${Number(dur).toFixed(1)} s clip`);
+        run?.start('blend', 'Blending onto the end of the timeline');
 
         let newClip;
         if (targetAngle !== null) {
@@ -2737,26 +3482,39 @@ async function handleAddMotion(params) {
         if (groundMesh) applyTerrainFromPath(groundMesh, fullPath);
 
         log(`Added motion: "${params.prompt}" (${newClip.duration.toFixed(1)}s)`, 'success', 'chat-action');
+        run?.done('blend', `Clip ${timelineClips.length} added, ${newClip.duration.toFixed(1)} s`);
     } catch (err) {
         log(`Error: ${err.message}`, 'error', 'chat-action');
+        run?.failActive(err.message);
     }
-    setPill('pill-motion', false);
 }
 
 // Handle modify_scene action
 function handleModifyScene(params) {
     const changes = params.changes || {};
+    const run = currentRun;
+    run?.add('apply', 'Scene change');
+    run?.start('apply');
+    const did = [];
     if (changes.ground_color && groundMesh) {
         groundMesh.material.color.set(changes.ground_color);
         log(`Ground color changed to ${changes.ground_color}`, 'scene');
+        did.push('ground color');
     }
     if (changes.ambient_intensity !== undefined) {
-        scene.traverse(obj => {
-            if (obj.isAmbientLight) obj.intensity = changes.ambient_intensity;
-        });
+        const base = (ENV_PRESETS[envName] || ENV_PRESETS.day).hemiI;
+        hemiLight.intensity = THREE.MathUtils.clamp(base * changes.ambient_intensity, 0.2, 4);
         log(`Ambient light set to ${changes.ambient_intensity}`, 'scene');
+        did.push('light');
+    }
+    if (typeof changes.fog === 'boolean' && scene.fog) {
+        const f = (ENV_PRESETS[envName] || ENV_PRESETS.day).fog;
+        scene.fog.near = changes.fog ? 150 : f[0];
+        scene.fog.far = changes.fog ? 1400 : f[1];
+        did.push(changes.fog ? 'fog on' : 'fog off');
     }
     log('Scene updated', 'success');
+    run?.done('apply', did.length ? `Changed ${did.join(', ')}` : 'Nothing to change');
 }
 
 // Main chat handler
@@ -2764,11 +3522,17 @@ async function handleChat(userMsg) {
     if (!userMsg.trim() || !currentClip) return;
 
     chatInput.disabled = true;
-    chatInput.placeholder = 'Processing...';
+    chatInput.placeholder = 'Working on it...';
+    syncChatSend();
     log(`> ${userMsg}`, 'user');
+    const run = new Run(userMsg, [['understand', 'Understand']], 'chat');
+    run.start('understand', 'Gemini reads the request');
 
     try {
         const intent = await classifyChat(userMsg);
+        const what = { add_motion: 'A new motion', add_object: 'An object to add', modify_scene: 'A scene change' }[intent.action];
+        if (what) run.done('understand', what);
+        else run.fail('understand', 'Not sure what that means. Try a motion, an object, or a scene change.');
 
         switch (intent.action) {
             case 'add_motion':
@@ -2785,75 +3549,57 @@ async function handleChat(userMsg) {
         }
     } catch (err) {
         log(`Error: ${err.message}`, 'error');
+        run.failActive(err.message);
     }
+    const last = run.steps[run.steps.length - 1];
+    run.finish(run.steps.some(s => s.state === 'failed') ? '' : (last.detail || 'Done'));
 
     chatInput.disabled = false;
-    chatInput.placeholder = 'Add motion, object, or action...';
-    chatInput.focus();
+    chatInput.placeholder = CHAT_PLACEHOLDER;
+    syncChatSend();
+    if (!IS_SMALL) chatInput.focus();
 }
 
-chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-        const msg = chatInput.value.trim();
-        chatInput.value = '';
-        handleChat(msg);
-    }
-});
+if (window.innerWidth < 600) chatInput.placeholder = 'What happens next?';
+const CHAT_PLACEHOLDER = chatInput.placeholder;
+const chatSend = document.getElementById('chat-send');
+function syncChatSend() { chatSend.disabled = chatInput.disabled || !chatInput.value.trim(); }
+function submitChat() {
+    const msg = chatInput.value.trim();
+    if (!msg || chatInput.disabled) return;
+    chatInput.value = '';
+    syncChatSend();
+    handleChat(msg);
+}
+chatInput.addEventListener('input', syncChatSend);
+chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitChat(); });
+chatSend.addEventListener('click', submitChat);
+syncChatSend();
+
+function showPromptDock() {
+    document.getElementById('prompt-dock').classList.add('visible');
+    document.getElementById('render-btn').style.display = '';
+}
 
 // Panel collapse/reopen
-document.getElementById('panel-collapse').addEventListener('click', () => {
-    document.getElementById('panel').classList.add('collapsed');
-    setTimeout(() => document.getElementById('panel-reopen').classList.add('visible'), 200);
-});
-document.getElementById('panel-reopen').addEventListener('click', () => {
-    document.getElementById('panel-reopen').classList.remove('visible');
-    document.getElementById('panel').classList.remove('collapsed');
-});
+function setPanelOpen(open) {
+    document.getElementById('panel').classList.toggle('collapsed', !open);
+    document.getElementById('panel-reopen').classList.toggle('visible', !open);
+}
+document.getElementById('panel-collapse').addEventListener('click', () => setPanelOpen(false));
+document.getElementById('panel-reopen').addEventListener('click', () => setPanelOpen(true));
 
-// Reset view button — shows when camera deviates from default
-const defaultCamPos = new THREE.Vector3(0, 150, 400);
-const defaultTarget = new THREE.Vector3(0, 100, 0);
+// ?debug exposes camera state for automated checks.
+if (new URLSearchParams(location.search).has('debug')) {
+    window.__kinetik = { camera, controls, cam, characterAnchor, THREE, scene, renderer, sun, getGround: () => groundMesh };
+}
+
+// Recenter button: shows once the user has moved the camera themselves.
 const resetBtn = document.getElementById('reset-view');
-
-let _resetAnimating = false;
-resetBtn.addEventListener('click', () => {
-    // Smooth animated reset to character's current position
-    _resetAnimating = true;
-    const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
-    const targetTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
-    const targetCam = new THREE.Vector3(charPos.x, 250, charPos.z + 400);
-
-    let step = 0;
-    const duration = 30; // frames
-    const startCam = camera.position.clone();
-    const startTarget = controls.target.clone();
-    function animateReset() {
-        step++;
-        const t = step / duration;
-        const ease = t * t * (3 - 2 * t); // smoothstep
-        camera.position.lerpVectors(startCam, targetCam, ease);
-        controls.target.lerpVectors(startTarget, targetTarget, ease);
-        controls.update();
-        if (step < duration) requestAnimationFrame(animateReset);
-        else _resetAnimating = false;
-    }
-    animateReset();
-});
-
-// Check camera deviation every 500ms
+resetBtn.addEventListener('click', () => frameCharacter(true));
 setInterval(() => {
-    if (_resetAnimating) return;
-    const charPos = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(charPos);
-    const currentTarget = new THREE.Vector3(charPos.x, 100, charPos.z);
-    const posDiff = controls.target.distanceTo(currentTarget);
-    if (posDiff > 200) {
-        resetBtn.classList.add('visible');
-    } else {
-        resetBtn.classList.remove('visible');
-    }
-}, 500);
+    resetBtn.classList.toggle('visible', cam.active && cam.userMoved && !cam.locked);
+}, 300);
 
 // ========== SCENE EDITOR ==========
 const edToolbar = document.getElementById('editor-toolbar');
@@ -2886,19 +3632,15 @@ function showEditorInfo(msg) {
 const tabActivity = document.getElementById('tab-activity');
 const tabAdd = document.getElementById('tab-add');
 const consoleEl = document.getElementById('console');
-const chatBar = document.getElementById('chat-input-bar');
 const addContent = document.getElementById('add-tab-content');
 
 function switchTab(tab) {
-    if (tab === 'activity') {
-        tabActivity.classList.add('active'); tabAdd.classList.remove('active');
-        consoleEl.style.display = ''; chatBar.style.display = '';
-        addContent.classList.remove('visible');
-    } else {
-        tabAdd.classList.add('active'); tabActivity.classList.remove('active');
-        consoleEl.style.display = 'none'; chatBar.style.display = 'none';
-        addContent.classList.add('visible');
-    }
+    const lib = tab !== 'activity';
+    tabActivity.classList.toggle('active', !lib);
+    tabAdd.classList.toggle('active', lib);
+    consoleEl.style.display = lib ? 'none' : '';
+    addContent.classList.toggle('visible', lib);
+    document.getElementById('panel').classList.toggle('tall', lib);
 }
 tabActivity.addEventListener('click', () => switchTab('activity'));
 tabAdd.addEventListener('click', () => switchTab('add'));
@@ -2910,6 +3652,8 @@ const createStatus = document.getElementById('add-create-status');
 
 const GEMINI_IMG_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${GEMINI_KEY}`;
 const FAL_KEY = ''; // Set your fal.ai API key here (see .env)
+// Custom models need both keys; hide the input instead of letting it fail.
+if (!FAL_KEY || !GEMINI_KEY) document.getElementById('add-create-wrap').style.display = 'none';
 
 createInput.addEventListener('keydown', async (e) => {
     if (e.key !== 'Enter') return;
@@ -2974,40 +3718,33 @@ createInput.addEventListener('keydown', async (e) => {
 // Populate model picker with thumbnails
 const AVAILABLE_MODELS = Object.keys(MODEL_MAP);
 
-const MODEL_ICONS = {
-    tree:'🌳',pine:'🌲',bush:'🌿',rock:'🪨',building:'🏢',house:'🏠',shop:'🏪',
-    car:'🚗',truck:'🚛',street_lamp:'💡',bench:'🪑',hydrant:'🧯',trash_can:'🗑️',
-    sofa:'🛋️',bookshelf:'📚',table:'🪑',lamp:'💡',chair:'🪑',statue:'🗿',
-    fountain:'⛲',barrel:'🪣',fence_post:'🚧',mailbox:'📬',stop_sign:'🛑',
-    traffic_cone:'🔶',dumpster:'🗑️',picnic_table:'🪑',swing_set:'🎠',slide:'🛝',
-    gazebo:'⛺',bridge:'🌉',boat:'⛵',motorcycle:'🏍️',bicycle:'🚲',castle:'🏰',
-    windmill:'🌀',tent:'⛺',campfire:'🔥',log:'🪵',grave_tombstone:'🪦',
-    pumpkin:'🎃',soccer_goal:'⚽',basketball_hoop:'🏀',punching_bag:'🥊',
-    treadmill:'🏋️',piano:'🎹',bed:'🛏️',bathtub:'🛁',toilet:'🚽',
-    refrigerator:'🧊',oven:'🍳',television:'📺',computer_desk:'🖥️',
-    office_chair:'💺',filing_cabinet:'🗄️',vending_machine:'🎰',phone_booth:'📞',
-    bus_stop_shelter:'🚏',water_tower:'🗼'
-};
+// Models that ship a thumbnail in models/; the rest get a lettered tile.
+const MODEL_THUMBS = new Set(['barrel','bench','bookshelf','building','bush','car','chair','dumpster','fence_post','fountain','house','hydrant','lamp','mailbox','rock','shop','sofa','statue','stop_sign','street_lamp','table','traffic_cone','trash_can','tree','truck']);
 
 function addModelToPicker(name, thumbUrl) {
     const div = document.createElement('div');
     div.className = 'mp-item';
 
-    const img = document.createElement('img');
-    img.className = 'mp-thumb';
-    img.src = thumbUrl || `models/${name}.png`;
-    img.onerror = () => {
-        img.style.display = 'none';
-        // Show emoji icon as fallback
-        const icon = document.createElement('div');
-        icon.className = 'mp-icon';
-        icon.textContent = MODEL_ICONS[name] || '📦';
-        div.insertBefore(icon, label);
-    };
-
     const label = document.createElement('span');
     label.textContent = name.replace(/_/g, ' ');
-    div.appendChild(img);
+    const monogram = () => {
+        const icon = document.createElement('div');
+        icon.className = 'mp-icon';
+        icon.textContent = name.charAt(0);
+        return icon;
+    };
+    const src = thumbUrl || (MODEL_THUMBS.has(name) ? `models/${name}.png` : null);
+    if (src) {
+        const img = document.createElement('img');
+        img.className = 'mp-thumb';
+        img.loading = 'lazy';
+        img.alt = '';
+        img.src = src;
+        img.onerror = () => img.replaceWith(monogram());
+        div.appendChild(img);
+    } else {
+        div.appendChild(monogram());
+    }
     div.appendChild(label);
     div.addEventListener('click', () => {
         enterPlaceMode(name);
@@ -3318,9 +4055,13 @@ renderBtn.addEventListener('click', async () => {
 
     // Find orbit center — use character position
     const orbitCenter = new THREE.Vector3();
-    if (currentBones) currentBones.getWorldPosition(orbitCenter);
+    characterAnchor(orbitCenter);
     orbitCenter.y = 0;
 
+    cam.locked = true;
+    clearFades();
+    document.body.classList.add('rendering');
+    const renderLabel = document.getElementById('render-label');
     // Save original camera state
     const origPos = camera.position.clone();
     const origTarget = controls.target.clone();
@@ -3349,6 +4090,8 @@ renderBtn.addEventListener('click', async () => {
             const e = t * t * (3 - 2 * t); // smoothstep
             camera.position.lerpVectors(zoomFrom, zoomTarget, e);
             camera.lookAt(orbitCenter.x, 40, orbitCenter.z);
+            fadeBlockers();
+            updateFades(1 / 60);
             renderer.render(scene, camera);
             if (t < 1) requestAnimationFrame(zoomStep);
             else resolve();
@@ -3360,6 +4103,7 @@ renderBtn.addEventListener('click', async () => {
     if (!musicAudio || musicAudio.paused) {
         const scenePrompt = timelineClips.map(c => c.prompt).join('. ') || 'ambient scene';
         renderFill.style.width = '0%';
+        renderLabel.textContent = 'Composing soundtrack';
         renderProgress.style.display = 'block';
         log('Generating soundtrack...', 'music', 'render-status');
         await generateMusic(scenePrompt);
@@ -3378,6 +4122,7 @@ renderBtn.addEventListener('click', async () => {
     }
 
     // Show progress bar
+    renderLabel.textContent = 'Recording orbit';
     renderProgress.style.display = 'block';
     renderFill.style.width = '0%';
 
@@ -3437,6 +4182,8 @@ renderBtn.addEventListener('click', async () => {
 
         if (mixer) mixer.update(dt);
         if (!skinnedCharMesh) updateBodyMeshes();
+        fadeBlockers();
+        updateFades(dt);
         renderer.render(scene, camera);
 
         if (t < 1) {
@@ -3448,11 +4195,13 @@ renderBtn.addEventListener('click', async () => {
             controls.target.copy(origTarget);
             controls.enabled = true;
             controls.update();
+            cam.locked = false;
 
             // Stop music after render
             if (musicAudio) { musicAudio.pause(); musicAudio.currentTime = 0; }
 
             renderProgress.style.display = 'none';
+            document.body.classList.remove('rendering');
             log('Render complete', 'success', 'render-status');
         }
     }
@@ -3484,7 +4233,7 @@ async function handleImportFile(e) {
 
         // Dismiss welcome if visible
         document.getElementById('welcome').classList.add('hidden');
-        document.getElementById('panel').classList.remove('collapsed');
+        setPanelOpen(true);
 
         // Rebuild scene from saved data
         const config = {
@@ -3521,6 +4270,7 @@ async function handleImportFile(e) {
         // Load BVH animation
         if (data.bvh) {
             await loadBVH(data.bvh);
+            prepareCharacter();
             lastBvhText = data.bvh;
 
             // Rebuild timeline
@@ -3532,10 +4282,12 @@ async function handleImportFile(e) {
             totalDuration = currentClip.duration;
             renderTimelineClips();
             showTimeline();
-            document.getElementById('tl-playpause').innerHTML = '<svg width="10" height="12" viewBox="0 0 10 12"><rect x="1" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/><rect x="6.5" y="0" width="2.5" height="12" rx="0.5" fill="currentColor"/></svg>';
+            setPlayIcon(true);
             isPlaying = true;
         }
 
+        cam.active = true;
+        controls.autoRotate = false;
         // Restore camera
         if (data.camera) {
             camera.position.set(...data.camera.position);
