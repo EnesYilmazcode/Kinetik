@@ -1,7 +1,7 @@
 # Kinetik
 
 <p align="center">
-  <img src="assets/media/Kinetik.gif" alt="Kinetik demo" width="600">
+  <img src="assets/media/landing.gif" alt="Kinetik landing screen" width="720">
 </p>
 
 Text-to-animated-3D-scene editor. Type a sentence, get a full 3D scene with an animated character. Edit the scene live — add objects, chain motions, sculpt terrain. No mocap, no Blender, no animators.
@@ -67,7 +67,7 @@ Built at GLITCH x Google DeepMind @ UCLA.
 - **Prompt enhancement** — silently rewrites prompts for better Kimodo results
 
 <p align="center">
-  <img src="assets/media/renderdemo.gif" alt="Render demo" width="600">
+  <img src="assets/media/render-park.gif" alt="Two chained clips: a jog through a park at sunset, then a backflip" width="720">
 </p>
 
 ## Stack
