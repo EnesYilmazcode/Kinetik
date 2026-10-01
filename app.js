@@ -1901,7 +1901,7 @@ function setPill() {} // legacy no-op
 // --- Motion server (GPU) state ---
 // /health only answers once the model is loaded, so a slow reply means a cold GPU.
 const gpu = { state: 'checking', since: performance.now(), info: null, lastOk: 0 };
-const COLD_START_NOTE = 'The motion model runs on a Modal L4 GPU that sleeps when idle. Waking it and loading the model takes about 90 seconds the first time; after that a motion takes about 7.';
+const COLD_START_NOTE = 'The motion model runs on a Modal L4 GPU that sleeps when idle. Waking it can take up to two minutes; after that a motion takes about 7 seconds.';
 
 function setGpu(state, info) {
     if (state !== gpu.state) gpu.since = performance.now();
@@ -1922,7 +1922,7 @@ function renderGpu() {
     }[gpu.state];
     const longText = {
         checking: 'Connecting to the motion model',
-        warming: `The motion model is waking up on a Modal ${name} GPU (${secs}s). A cold start takes about 90 s.`,
+        warming: `The motion model is waking up on a Modal ${name} GPU (${secs}s). A cold start can take up to two minutes.`,
         ready: `Motion model ready on a Modal ${name} GPU`,
         offline: 'Motion server unreachable. Generation will fail until it is back.',
     }[gpu.state];
@@ -1943,7 +1943,7 @@ async function checkHealth() {
         if (!res.ok) throw new Error(`health ${res.status}`);
         const info = await res.json();
         setGpu('ready', info);
-        log(`Motion model ready: ${info.model} on Modal ${info.gpu}` + (info.load_seconds ? ` (loaded in ${info.load_seconds}s)` : ''), 'success');
+        log(`Motion model ready: ${info.model} on Modal ${info.gpu}` , 'success');
     } catch (e) {
         if (gpu.state !== 'ready') setGpu('offline');
         log('Motion server unreachable, generation will fail', 'error');
@@ -1957,7 +1957,7 @@ function motionWaitText() {
     const idle = gpu.lastOk && performance.now() - gpu.lastOk > 290000; // Modal scales down after 300 s idle
     if (gpu.state === 'ready' && !idle) return `Kimodo on a Modal ${gpu.info?.gpu || 'L4'} GPU`;
     if (gpu.state === 'offline') return 'Trying the motion server';
-    return 'Waiting for the GPU to warm up, about 90 s on a cold start';
+    return 'Waiting for the GPU to warm up, up to two minutes on a cold start';
 }
 function motionReceived() {
     if (gpu.state !== 'ready') setGpu('ready');
