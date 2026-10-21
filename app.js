@@ -8,7 +8,7 @@ import { ASSETS, vegetationFor, realHeight, settingFor, makePathFrame, rng, layo
 
 // Kimodo motion server on Modal (scripts/modal_app.py). Override with ?api=<url>.
 const API = new URLSearchParams(location.search).get('api')
-    || 'https://enesyilmaz5157--kinetik-kimodo-web.modal.run';
+    || 'https://galaxyenocan--kinetik-kimodo-web.us-east.modal.run';
 const GEMINI_KEY = ''; // Set your Gemini API key here (see .env)
 if (!GEMINI_KEY) console.warn('GEMINI_KEY not set — scene generation will not work (see .env)');
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
@@ -2723,10 +2723,10 @@ checkHealth();
 
 // ========== WELCOME PREVIEW — separate mini renderer in a box ==========
 const WELCOME_MOTIONS = [
-    { file: 'assets/motions/backflip.bvh', label: 'backflip' },
-    { file: 'assets/motions/silly_dance.bvh', label: 'dancing' },
-    { file: 'assets/motions/spinning_kick.bvh', label: 'spinning kick', mirror: true },
-    { file: 'assets/motions/sneak_forward.bvh', label: 'sneaking' },
+    { file: 'assets/motions/backflip.bvh', label: 'a backflip' },
+    { file: 'assets/motions/silly_dance.bvh', label: 'a silly dance' },
+    { file: 'assets/motions/spinning_kick.bvh', label: 'a spinning kick', mirror: true },
+    { file: 'assets/motions/sneak_forward.bvh', label: 'sneaking forward' },
     { file: 'assets/motions/drunk_dance.bvh', label: 'vibing' },
 ];
 let welcomeMotionIdx = 0;
