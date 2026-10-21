@@ -426,7 +426,8 @@ function enhanceMotionPrompt(userPrompt) {
     }
 
     // If no movement verb was found, append locomotion bias
-    const hasMovement = /walk|run|jog|step|move|kick|punch|jump|dance|sneak|strid|crawl/i.test(p);
+    // Acrobatics count too: the walking suffix turns a flip into a walk.
+    const hasMovement = /walk|run|jog|step|move|kick|punch|jump|dance|sneak|strid|crawl|flip|cartwheel|somersault|handspring|roll|spin|leap|vault|tumbl/i.test(p);
     if (!hasMovement) {
         p += '. The person should walk forward while doing this, covering distance across the space';
     }
