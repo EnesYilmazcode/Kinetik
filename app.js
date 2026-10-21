@@ -432,8 +432,11 @@ function enhanceMotionPrompt(userPrompt) {
         p += '. The person should walk forward while doing this, covering distance across the space';
     }
 
-    // Always append quality suffix
-    p += '. Make all movements large, exaggerated, and continuous. The person should travel forward through space, not stay in place.';
+    // Always append quality suffix. Asking a backflip to travel forward makes Kimodo stand still.
+    const acrobatic = /flip|cartwheel|somersault|handspring/i.test(p);
+    p += acrobatic
+        ? '. Make the movement large, athletic, and complete, landing on both feet.'
+        : '. Make all movements large, exaggerated, and continuous. The person should travel forward through space, not stay in place.';
 
     return p;
 }
