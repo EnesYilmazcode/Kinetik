@@ -1,7 +1,7 @@
 # Kinetik
 
 <p align="center">
-  <img src="assets/media/landing.gif" alt="Kinetik landing screen" width="720">
+  <img src="assets/media/landing-v2.gif" alt="Kinetik welcome screen: a prompt being typed next to the motion preview" width="720">
 </p>
 
 Text-to-animated-3D-scene editor. Type a sentence, get a full 3D scene with an animated character. Edit the scene live — add objects, chain motions, sculpt terrain. No mocap, no Blender, no animators.

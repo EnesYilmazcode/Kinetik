@@ -106,22 +106,25 @@
         <div id="welcome">
           <div class="w-left">
             <div class="w-brand">kinetik</div>
-            <div class="w-tagline">Describe a scene.<br><span>Watch it come alive.</span></div>
+            <h1 class="w-tagline">Type what someone does.<br><span>Watch it happen in 3D.</span></h1>
+            <p class="w-sub">One sentence becomes an animated person in a world built around them. Then keep typing to add the next move.</p>
             <div class="w-input-wrap">
-              <input type="text" id="welcome-input" placeholder="A person sneaks through a forest..." autofocus autocomplete="off">
-              <button class="w-input-arrow" id="welcome-go" aria-label="Generate"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10M8.5 3.5L13 8l-4.5 4.5"/></svg></button>
+              <input type="text" id="welcome-input" placeholder="A person sneaks through a forest..." autofocus autocomplete="off" aria-label="Describe a scene">
+              <button class="w-input-arrow" id="welcome-go" aria-label="Create"><span>Create</span><svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10M8.5 3.5L13 8l-4.5 4.5"/></svg></button>
             </div>
+            <div class="w-try">Or try one</div>
             <div class="w-examples">
-                <button class="w-ex" data-prompt="A person walks through a busy city street"><span class="w-ex-label">City</span></button>
-                <button class="w-ex" data-prompt="A person jogs through a park at sunrise"><span class="w-ex-label">Park</span></button>
-                <button class="w-ex" data-prompt="A person explores a spooky graveyard at night"><span class="w-ex-label">Spooky</span></button>
-                <button class="w-ex" data-prompt="A person celebrates winning on a sports field"><span class="w-ex-label">Victory</span></button>
+                <button class="w-ex" data-prompt="A person sprints at full speed through a sunny park"><span class="w-ex-label">Sprint through a sunny park</span></button>
+                <button class="w-ex" data-prompt="A person sneaks through a dark forest"><span class="w-ex-label">Sneak through a dark forest</span></button>
+                <button class="w-ex" data-prompt="A person does a backflip in place in a city plaza"><span class="w-ex-label">Backflip in a city plaza</span></button>
+                <button class="w-ex" data-prompt="A person does a sideways cartwheel in a city plaza"><span class="w-ex-label">Cartwheel in a city plaza</span></button>
             </div>
             <div class="w-status" id="w-status"><span class="gpu-dot"></span><span id="w-status-text">Connecting to the motion model</span></div>
           </div>
           <div class="w-right">
-            <div id="w-preview"></div>
-            <div class="w-motion-label" id="w-motion-label">backflip</div>
+            <div id="w-preview">
+              <div class="w-motion-label" id="w-motion-label">a backflip</div>
+            </div>
           </div>
         </div>
 
